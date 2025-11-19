@@ -1,3 +1,4 @@
+# type: ignore
 import gymnasium as gym
 from gymnasium.wrappers import (
     AddRenderObservation,
@@ -18,6 +19,8 @@ from models import Conv3DTransformerNet, Conv3dResNet, TinyCNN
 # --- Configuration and Hyperparameters ---
 USE_MIXED_PRECISION = True  # Use bfloat16 automatic mixed precision
 USE_TORCH_COMPILE = False  # torch.compile() for speedup (requires PyTorch 2.0+)
+HEADLESS = True  # Set to True to disable cv2 visualization window
+CHECKPOINT_INTERVAL = 1000  # Save checkpoint every N episodes
 
 # PPO-specific hyperparameters
 LEARNING_RATE = 3e-4  # PPO can handle higher learning rates due to clipping
@@ -30,14 +33,14 @@ REWARD_CLIP = 5.0  # Clip rewards to [-REWARD_CLIP, +REWARD_CLIP] for stability
 
 # PPO-specific parameters
 CLIP_EPSILON = 0.2  # PPO clipping parameter
-BATCH_SIZE = 32  # Minibatch size for PPO updates
+BATCH_SIZE = 64  # Minibatch size for PPO updates
 PPO_EPOCHS = 4  # Number of epochs to train on collected data
-COLLECT_EPISODES = 8  # Number of episodes to collect before updating
+COLLECT_EPISODES = 16  # Number of episodes to collect before updating
 
 LOG_FILE = "training_log_ppo.txt"  # Log file for training metrics
 IMAGE_SIZE = 128
 NUM_FRAMES = 16
-
+MAX_EPISODE_STEPS = 500
 # Setup device (CPU or GPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -51,20 +54,20 @@ if USE_MIXED_PRECISION and device.type == "cuda":
     else:
         dtype = torch.float16
         print("Using float16 mixed precision training")
-    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == torch.float16))
+    scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
 else:
     dtype = torch.float32
     scaler = None
     print("Using float32 (no mixed precision)")
 
 env_name = "LunarLander-v3"
-env = gym.make(env_name, render_mode="rgb_array", max_episode_steps=250)
+env = gym.make(env_name, render_mode="rgb_array", max_episode_steps=MAX_EPISODE_STEPS)
 NUM_ACTIONS = env.action_space.n  # pyright: ignore
 
 # Apply wrappers for visual processing (as in your original code)
 env = AddRenderObservation(env)
 env = ResizeObservation(env, shape=(IMAGE_SIZE, IMAGE_SIZE))
-env = GrayscaleObservation(env, keep_dim=True)  # Output is (H, W, 1)
+env = GrayscaleObservation(env, keep_dim=True)
 env = FrameStackObservation(env, NUM_FRAMES)
 # --- 3. Model Initialization ---
 
@@ -82,6 +85,41 @@ if USE_TORCH_COMPILE:
 
 # Optimizer
 optimizer = optim.Adam(agent.parameters(), lr=LEARNING_RATE)
+
+# --- Load checkpoint if available ---
+import glob
+import os
+
+start_episode = 0
+checkpoint_files = sorted(glob.glob("checkpoints/checkpoint_*.pt"))
+if checkpoint_files:
+    latest_checkpoint = checkpoint_files[-1]
+    print(f"Loading checkpoint: {latest_checkpoint}")
+    checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=False)
+    agent.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    start_episode = checkpoint["episode"]
+    print(f"Resuming from episode {start_episode}")
+
+    # Truncate training log to remove entries after start_episode
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "r") as f:
+            lines = f.readlines()
+
+        # Keep header + lines up to start_episode
+        header = lines[0]
+        data_lines = lines[1:]
+        truncated_lines = [header]
+        for line in data_lines:
+            episode_num = int(line.split(",")[0])
+            if episode_num <= start_episode:
+                truncated_lines.append(line)
+
+        with open(LOG_FILE, "w") as f:
+            f.writelines(truncated_lines)
+        print(f"Truncated log file to episode {start_episode}")
+else:
+    print("No checkpoint found, starting from scratch")
 
 # --- 4. Helper Functions for PPO ---
 
@@ -165,6 +203,13 @@ def ppo_update(
     Returns:
         actor_loss, critic_loss, entropy: Loss values for logging
     """
+    # Move mini-batch to device
+    states = states.to(device)
+    actions = actions.to(device)
+    old_log_probs = old_log_probs.to(device)
+    advantages = advantages.to(device)
+    returns = returns.to(device)
+
     # Forward pass
     with torch.amp.autocast("cuda", enabled=USE_MIXED_PRECISION, dtype=dtype):
         action_logits, values = agent(states.unsqueeze(1))
@@ -214,24 +259,28 @@ def ppo_update(
 
 print("\nStarting Proximal Policy Optimization (PPO) simulation loop...")
 
-# Open log file
-log_file = open(LOG_FILE, "w")
-log_file.write(
-    "Episode,Steps,TotalReward,ActorLoss,CriticLoss,MeanValue,ValueStd,MeanReturn,ClipFraction\n"
-)
+# Open log file (append if resuming, write if starting fresh)
+if start_episode > 0:
+    log_file = open(LOG_FILE, "a")
+    print(f"Appending to existing log file: {LOG_FILE}")
+else:
+    log_file = open(LOG_FILE, "w")
+    log_file.write(
+        "Episode,Steps,TotalReward,ActorLoss,CriticLoss,MeanValue,ValueStd,MeanReturn,ClipFraction\n"
+    )
+    print(f"Created new log file: {LOG_FILE}")
 
 # Rollout buffer for collecting multiple episodes
 rollout_states = []
 rollout_actions = []
 rollout_log_probs = []
-rollout_values = []
 rollout_rewards = []
 rollout_advantages = []
 rollout_returns = []
 
 episode_count = 0
 
-for episode in range(NUM_EPISODES):
+for episode in range(start_episode, NUM_EPISODES):
     # Data storage for the episode
     episode_states = []
     episode_actions = []
@@ -252,8 +301,8 @@ for episode in range(NUM_EPISODES):
         image_tensor = torch.from_numpy(observation).permute(3, 0, 1, 2).float()
         input_tensor = image_tensor.to(device) / 255.0
 
-        # Store state
-        episode_states.append(input_tensor)
+        # Store state on CPU to save GPU memory
+        episode_states.append(input_tensor.cpu())
 
         # Forward pass with mixed precision
         with torch.amp.autocast("cuda", enabled=USE_MIXED_PRECISION, dtype=dtype):
@@ -264,10 +313,10 @@ for episode in range(NUM_EPISODES):
         action_dist = Categorical(logits=action_logits.float())
         action = action_dist.sample()
 
-        # Store data
-        episode_actions.append(action)
-        episode_log_probs.append(action_dist.log_prob(action))
-        episode_values.append(value.squeeze(-1))
+        # Store data on CPU
+        episode_actions.append(action.detach().cpu())
+        episode_log_probs.append(action_dist.log_prob(action).detach().cpu())
+        episode_values.append(value.squeeze(-1).detach().cpu())
 
         # Step environment
         observation, reward, terminated, truncated, info = env.step(action.item())
@@ -278,14 +327,15 @@ for episode in range(NUM_EPISODES):
 
         steps += 1
 
-        # Render the agent's grayscale view
-        display_frame = observation[-1, :, :, :]
-        display_frame = np.interp(
-            display_frame, (display_frame.min(), display_frame.max()), (0, 255)
-        ).astype(np.uint8)
-        cv2.imshow("Agent View (84x84 Grayscale)", display_frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            sys.exit("Simulation stopped by user.")
+        # Render the agent's grayscale view (if not headless)
+        if not HEADLESS:
+            display_frame = observation[-1, :, :, :]
+            display_frame = np.interp(
+                display_frame, (display_frame.min(), display_frame.max()), (0, 255)
+            ).astype(np.uint8)
+            cv2.imshow("Agent View (84x84 Grayscale)", display_frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                sys.exit("Simulation stopped by user.")
 
     # Episode finished - add to rollout buffer
     if episode_rewards:  # Only if episode had steps
@@ -299,24 +349,24 @@ for episode in range(NUM_EPISODES):
             with torch.amp.autocast("cuda", enabled=USE_MIXED_PRECISION, dtype=dtype):
                 with torch.no_grad():
                     _, next_value = agent(input_tensor.unsqueeze(1))
-                    next_value = next_value.squeeze(-1)
+                    next_value = next_value.squeeze(-1).detach()
 
         # Calculate GAE advantages and returns
         values_tensor = torch.cat(episode_values)
         advantages, returns = calculate_gae(
-            episode_rewards, values_tensor, next_value, GAMMA, GAE_LAMBDA
+            episode_rewards, values_tensor.to(device), next_value, GAMMA, GAE_LAMBDA
         )
 
         # Add to rollout buffer
         rollout_states.extend(episode_states)
         rollout_actions.extend(episode_actions)
         rollout_log_probs.extend(episode_log_probs)
-        rollout_values.extend([v for v in values_tensor])
+
         rollout_rewards.append(sum(episode_rewards))
 
         # Store advantages and returns (per timestep)
-        rollout_advantages.extend([a for a in advantages])
-        rollout_returns.extend([r for r in returns])
+        rollout_advantages.append(advantages.cpu())
+        rollout_returns.append(returns.cpu())
 
         episode_count += 1
 
@@ -345,8 +395,8 @@ for episode in range(NUM_EPISODES):
         states_batch = torch.cat(rollout_states)
         actions_batch = torch.cat(rollout_actions)
         old_log_probs_batch = torch.cat(rollout_log_probs)
-        advantages_batch = torch.stack(rollout_advantages)
-        returns_batch = torch.stack(rollout_returns)
+        advantages_batch = torch.cat(rollout_advantages)
+        returns_batch = torch.cat(rollout_returns)
 
         # Normalize advantages
         advantages_batch = (advantages_batch - advantages_batch.mean()) / (
@@ -423,11 +473,25 @@ for episode in range(NUM_EPISODES):
         rollout_states = []
         rollout_actions = []
         rollout_log_probs = []
-        rollout_values = []
         rollout_rewards = []
         rollout_advantages = []
         rollout_returns = []
         episode_count = 0
+
+        # Save checkpoint periodically
+        if (episode + 1) % CHECKPOINT_INTERVAL == 0:
+            import os
+
+            os.makedirs("checkpoints", exist_ok=True)
+            checkpoint = {
+                "episode": episode + 1,
+                "model_state_dict": agent.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "avg_reward": avg_reward,
+            }
+            checkpoint_path = f"checkpoints/checkpoint_{episode + 1:07d}.pt"
+            torch.save(checkpoint, checkpoint_path)
+            print(f"  Checkpoint saved: {checkpoint_path}")
 
     # Reset environment for next episode
     observation, info = env.reset()
@@ -435,5 +499,19 @@ for episode in range(NUM_EPISODES):
 # --- Cleanup ---
 log_file.close()
 env.close()
-cv2.destroyAllWindows()
+if not HEADLESS:
+    cv2.destroyAllWindows()
+
+# Save final checkpoint
+import os
+
+os.makedirs("checkpoints", exist_ok=True)
+checkpoint = {
+    "episode": episode + 1,
+    "model_state_dict": agent.state_dict(),
+    "optimizer_state_dict": optimizer.state_dict(),
+}
+checkpoint_path = f"checkpoints/checkpoint_{episode + 1:07d}.pt"
+torch.save(checkpoint, checkpoint_path)
+print(f"Final checkpoint saved: {checkpoint_path}")
 print(f"\nSimulation complete. Environment closed. Logs saved to {LOG_FILE}")

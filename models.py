@@ -113,13 +113,8 @@ class Conv3DTransformerNet(nn.Module):
 
 
 class TinyCNN(nn.Module):
-    """
-    Lightweight CNN feature encoder for RL with skip connections.
-    Input: (batch, 1, 16, 224, 224) - grayscale, 16 frames, 224x224
-    Output: (batch, feature_dim) - flattened feature vector
-    """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, num_actions=4, *args, **kwargs):
         super(TinyCNN, self).__init__()
 
         feature_dim = 512
@@ -153,38 +148,53 @@ class TinyCNN(nn.Module):
 
         self.relu = nn.ReLU(inplace=True)
 
-        self.actor = nn.Linear(256, 4)
+        self.actor = nn.Linear(256, num_actions)
         self.critic = nn.Linear(256, 1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Conv3d, nn.Linear)):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        # Orthogonal initialization for actor and critic layers
+        nn.init.orthogonal_(self.actor.weight, gain=0.01)
+        nn.init.zeros_(self.actor.bias)
+        nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        nn.init.zeros_(self.critic.bias)
 
     def forward(self, x):
         # First 3D convolutions to process temporal + spatial info
-        x = self.relu(self.bn1(self.conv1(x)))  # (batch, 32, 16, 112, 112)
-        x = self.temporal_pool1(x)  # (batch, 32, 4, 112, 112)
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.temporal_pool1(x)
 
         identity = self.skip2(x)
-        x = self.relu(self.bn2(self.conv2(x)))  # (batch, 64, 4, 56, 56)
+        x = self.relu(self.bn2(self.conv2(x)))
         x = x + identity  # Skip connection
-        x = self.temporal_pool2(x)  # (batch, 64, 1, 56, 56)
+        x = self.temporal_pool2(x)
 
         # Remove temporal dimension
-        x = x.squeeze(2)  # (batch, 64, 56, 56)
+        x = x.squeeze(2)
 
         # 2D convolutions with skip connections
         identity = self.skip3(x)
-        x = self.relu(self.bn3(self.conv3(x)))  # (batch, 128, 28, 28)
+        x = self.relu(self.bn3(self.conv3(x)))
         x = x + identity
 
         identity = self.skip4(x)
-        x = self.relu(self.bn4(self.conv4(x)))  # (batch, 256, 14, 14)
+        x = self.relu(self.bn4(self.conv4(x)))
         x = x + identity
 
         identity = self.skip5(x)
-        x = self.relu(self.bn5(self.conv5(x)))  # (batch, 256, 7, 7)
+        x = self.relu(self.bn5(self.conv5(x)))
         x = x + identity
 
         # Global pooling and final projection
-        x = self.global_pool(x)  # (batch, 256, 1, 1)
-        x = x.view(x.size(0), -1)  # (batch, 256)
+        x = self.global_pool(x)
+        x = x.view(x.size(0), -1)
         action_logits = self.actor(x)
         value = self.critic(x)
         return action_logits, value
