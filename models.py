@@ -57,10 +57,10 @@ class Conv3DTransformerNet(nn.Module):
         self.num_frames = num_frames
 
         self.conv3d_stem = nn.Sequential(
-            nn.Conv3d(1, 64, kernel_size=(8, 32, 32), stride=(4, 32, 32)),
+            nn.Conv3d(1, 64, kernel_size=(8, 16, 16), stride=(4, 16, 16)),
         )
 
-        self.seq_len = 147
+        self.seq_len = 192
         self.embed_dim = 64
 
         self.pos_embed = nn.Parameter(
@@ -76,7 +76,7 @@ class Conv3DTransformerNet(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
 
         self.norm = nn.LayerNorm(self.embed_dim)
         self.actor = nn.Linear(self.embed_dim, num_actions)
@@ -113,7 +113,6 @@ class Conv3DTransformerNet(nn.Module):
 
 
 class TinyCNN(nn.Module):
-
     def __init__(self, num_actions=4, *args, **kwargs):
         super(TinyCNN, self).__init__()
 
@@ -206,13 +205,8 @@ if __name__ == "__main__":
 
     num_actions = 4
     num_frames = 16
-    img_size = 224
-
-    print("=" * 60)
-    print("Testing Conv3dResNet")
-    print("=" * 60)
-
-    model = TinyCNN(num_actions=num_actions).to(device)
+    img_size = 128
+    model = Conv3DTransformerNet(num_actions=num_actions).to(device)
 
     dummy_input = torch.randn(1, 1, 16, img_size, img_size).to(device)
     print(f"Input shape: {dummy_input.shape}")

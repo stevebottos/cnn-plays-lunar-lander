@@ -143,38 +143,34 @@ if __name__ == "__main__":
             raise FileNotFoundError(f"Checkpoint not found at {args.resume_from}")
         # Infer run_dir from the checkpoint path
         run_dir = os.path.dirname(os.path.dirname(args.resume_from))
-        print(f"Resuming from checkpoint: {args.resume_from}")
-        print(f"Run directory restored to: {run_dir}")
 
     else:
         # Determine the base log directory
         base_log_dir = args.log_dir
         if base_log_dir == "runs":  # If default "runs" is used, append config_name
             base_log_dir = os.path.join(base_log_dir, config_name)
-            
+
         # Create a unique directory for this training run
-        run_name = args.run_name or f"{config.model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_name = (
+            args.run_name
+            or f"{config.model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
         run_dir = os.path.join(base_log_dir, run_name)
-        print(f"Starting new run in directory: {run_dir}")
 
     checkpoints_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(checkpoints_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
 
     if config.USE_MIXED_PRECISION and device.type == "cuda":
         if torch.cuda.is_bf16_supported():
             dtype = torch.bfloat16
-            print("Using bfloat16 mixed precision training")
         else:
             dtype = torch.float16
-            print("Using float16 mixed precision training")
         scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
     else:
         dtype = torch.float32
         scaler = None
-        print("Using float32 (no mixed precision)")
 
     env = gym.make(
         config.env_name,
@@ -188,7 +184,6 @@ if __name__ == "__main__":
     env = GrayscaleObservation(env, keep_dim=True)
     env = FrameStackObservation(env, config.NUM_FRAMES)
 
-    print(f"Using {config.model_name} architecture")
     if config.model_name == "TinyCNN":
         agent = TinyCNN(num_actions=NUM_ACTIONS).to(device)
     elif config.model_name == "Conv3dResNet":
@@ -203,40 +198,42 @@ if __name__ == "__main__":
     if config.USE_TORCH_COMPILE:
         try:
             agent = torch.compile(agent, mode="reduce-overhead")
-            print("Model compiled with torch.compile()")
         except Exception as e:
-            print(f"torch.compile() failed: {e}, continuing without compilation")
+            pass  # Keep silent if compilation fails
 
     optimizer = optim.Adam(agent.parameters(), lr=config.LEARNING_RATE)
 
     start_episode = 0
     if args.resume_from:
-        checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
+        checkpoint = torch.load(
+            args.resume_from, map_location=device, weights_only=False
+        )
         agent.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_episode = checkpoint["episode"]
-        print(f"Resuming from episode {start_episode}")
     else:
         # Find the latest checkpoint in the new run-specific checkpoints directory
-        checkpoint_files = sorted(glob.glob(os.path.join(checkpoints_dir, "checkpoint_*.pt")))
+        checkpoint_files = sorted(
+            glob.glob(os.path.join(checkpoints_dir, "checkpoint_*.pt"))
+        )
         if checkpoint_files:
             latest_checkpoint = checkpoint_files[-1]
-            print(f"Loading checkpoint: {latest_checkpoint}")
             checkpoint = torch.load(
                 latest_checkpoint, map_location=device, weights_only=False
             )
             agent.load_state_dict(checkpoint["model_state_dict"])
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             start_episode = checkpoint["episode"]
-            print(f"Resuming from episode {start_episode}")
-        else:
-            print("No checkpoint found, starting from scratch")
-
-    print("\nStarting Proximal Policy Optimization (PPO) simulation loop...")
 
     # Initialize TensorBoard writer
     writer = SummaryWriter(log_dir=run_dir)
     print(f"TensorBoard logs will be saved to: {run_dir}")
+    print(f"To view TensorBoard, run: tensorboard --logdir runs")
+    import socket
+
+    hostname = socket.gethostname()
+    ip_address = socket.gethostbyname(hostname)
+    print(f"TensorBoard running on: http://{ip_address}:6006")
 
     rollout_states = []
     rollout_actions = []
@@ -318,16 +315,9 @@ if __name__ == "__main__":
             mean_value = values_tensor.mean().item()
             value_std = values_tensor.std().item()
             mean_return = returns.mean().item()
-            print(
-                f"Episode {episode + 1:4d} | Steps: {steps:3d} | Total Reward: {total_reward:6.2f} | "
-                f"Value: {mean_value:6.2f}±{value_std:.2f} | Return: {mean_return:6.2f}"
-            )
 
         if episode_count >= config.COLLECT_EPISODES:
             agent.train()
-            print(
-                f"  Collected {len(rollout_states)} states, {len(rollout_advantages)} advantages"
-            )
             states_batch = torch.cat(rollout_states)
             actions_batch = torch.cat(rollout_actions)
             old_log_probs_batch = torch.cat(rollout_log_probs)
@@ -338,7 +328,13 @@ if __name__ == "__main__":
             )
             dataset_size = len(states_batch)
             indices = np.arange(dataset_size)
-            total_actor_loss, total_critic_loss, total_entropy, num_updates, total_clip_fraction = (
+            (
+                total_actor_loss,
+                total_critic_loss,
+                total_entropy,
+                num_updates,
+                total_clip_fraction,
+            ) = (
                 0,
                 0,
                 0,
@@ -383,11 +379,6 @@ if __name__ == "__main__":
             avg_entropy = total_entropy / num_updates
             avg_clip_fraction = total_clip_fraction / num_updates
             avg_reward = np.mean(rollout_rewards)
-            print(
-                f"  PPO Update | Avg Reward: {avg_reward:6.2f} | "
-                f"Actor Loss: {avg_actor_loss:.4f} | Critic Loss: {avg_critic_loss:.4f} | "
-                f"Entropy: {avg_entropy:.4f} | ClipFrac: {avg_clip_fraction:.2f}"
-            )
             # Log hyperparameters and metrics
             writer.add_hparams(
                 {k: getattr(config, k) for k in config.__annotations__.keys()},
@@ -421,7 +412,6 @@ if __name__ == "__main__":
             ) = [], [], [], [], [], []
             episode_count = 0
 
-
             if (episode + 1) % config.CHECKPOINT_INTERVAL == 0:
                 checkpoint = {
                     "episode": episode + 1,
@@ -429,9 +419,10 @@ if __name__ == "__main__":
                     "optimizer_state_dict": optimizer.state_dict(),
                     "avg_reward": avg_reward,
                 }
-                checkpoint_path = os.path.join(checkpoints_dir, f"checkpoint_{episode + 1:07d}.pt")
+                checkpoint_path = os.path.join(
+                    checkpoints_dir, f"checkpoint_{episode + 1:07d}.pt"
+                )
                 torch.save(checkpoint, checkpoint_path)
-                print(f"  Checkpoint saved: {checkpoint_path}")
 
         observation, info = env.reset()
 
@@ -447,5 +438,3 @@ if __name__ == "__main__":
     }
     checkpoint_path = os.path.join(checkpoints_dir, f"checkpoint_{episode + 1:07d}.pt")
     torch.save(checkpoint, checkpoint_path)
-    print(f"Final checkpoint saved: {checkpoint_path}")
-    print(f"\nSimulation complete. Environment closed. Logs saved to {run_dir}")

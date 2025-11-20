@@ -3,7 +3,7 @@ checkpoints/
 notes/ 
 .python-version 
 .uv.lock 
-
+runs/
 # Python-generated files
 __pycache__/
 *.py[oc]

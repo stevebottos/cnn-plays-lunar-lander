@@ -17,7 +17,6 @@ class TrainingConfig:
     BATCH_SIZE: int
     PPO_EPOCHS: int
     COLLECT_EPISODES: int
-    LOG_FILE: str
     IMAGE_SIZE: int
     NUM_FRAMES: int
     MAX_EPISODE_STEPS: int
