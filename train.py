@@ -10,17 +10,18 @@ import torch
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.distributions import Categorical
-from torch.utils.tensorboard import SummaryWriter
+import mlflow
+import mlflow.tracking
 import numpy as np
 import cv2
 import sys
 import argparse
 import yaml
-import glob
 import os
 from datetime import datetime
+import tempfile
 
-from models import Conv3DTransformerNet, Conv3dResNet, TinyCNN
+from models import Conv3DTransformerNet, Conv3dResNet, TinyCNN, TinyCNNv2
 from configs.config import TrainingConfig
 
 
@@ -120,45 +121,40 @@ if __name__ == "__main__":
         help="Custom name for the training run.",
     )
     parser.add_argument(
-        "--log-dir",
-        type=str,
-        default="runs",
-        help="Directory to save training runs.",
-    )
-    parser.add_argument(
         "--resume-from",
         type=str,
         default=None,
         help="Path to a checkpoint file to resume training from.",
     )
+    parser.add_argument(
+        "--resume-run-id",
+        type=str,
+        default=None,
+        help="MLflow run ID to resume.",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
+    with open(args.config, "r") as f:
+        config_dict = yaml.safe_load(f)
 
     # Extract config name from path (e.g., "baseline" from "configs/baseline.yaml")
     config_name = os.path.splitext(os.path.basename(args.config))[0]
 
-    if args.resume_from:
-        if not os.path.isfile(args.resume_from):
-            raise FileNotFoundError(f"Checkpoint not found at {args.resume_from}")
-        # Infer run_dir from the checkpoint path
-        run_dir = os.path.dirname(os.path.dirname(args.resume_from))
-
+    # Setup MLflow
+    mlflow.set_experiment(config_name)
+    if args.resume_run_id:
+        run = mlflow.start_run(run_id=args.resume_run_id)
+        run_name = run.info.run_name
     else:
-        # Determine the base log directory
-        base_log_dir = args.log_dir
-        if base_log_dir == "runs":  # If default "runs" is used, append config_name
-            base_log_dir = os.path.join(base_log_dir, config_name)
-
-        # Create a unique directory for this training run
         run_name = (
             args.run_name
             or f"{config.model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         )
-        run_dir = os.path.join(base_log_dir, run_name)
+        run = mlflow.start_run(run_name=run_name)
+    mlflow.log_params(config_dict)
 
-    checkpoints_dir = os.path.join(run_dir, "checkpoints")
-    os.makedirs(checkpoints_dir, exist_ok=True)
+    print(f"MLflow experiment '{config_name}' started with run '{run_name}'.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -186,6 +182,8 @@ if __name__ == "__main__":
 
     if config.model_name == "TinyCNN":
         agent = TinyCNN(num_actions=NUM_ACTIONS).to(device)
+    elif config.model_name == "TinyCNNv2":
+        agent = TinyCNNv2(num_actions=NUM_ACTIONS).to(device)
     elif config.model_name == "Conv3dResNet":
         agent = Conv3dResNet(num_actions=NUM_ACTIONS).to(device)
     elif config.model_name == "Conv3DTransformerNet":
@@ -204,36 +202,48 @@ if __name__ == "__main__":
     optimizer = optim.Adam(agent.parameters(), lr=config.LEARNING_RATE)
 
     start_episode = 0
-    if args.resume_from:
+    if args.resume_run_id:
+        client = mlflow.tracking.MlflowClient()
+        # Get all artifacts from the 'checkpoints' directory
+        try:
+            artifacts = client.list_artifacts(args.resume_run_id, "checkpoints")
+            if artifacts:
+                # Sort artifacts by name (which includes the episode number) to find the latest
+                artifacts.sort(key=lambda x: x.path, reverse=True)
+                latest_checkpoint_artifact = artifacts[0]
+
+                # Download the latest checkpoint
+                checkpoint_path = client.download_artifacts(
+                    run_id=args.resume_run_id, path=latest_checkpoint_artifact.path
+                )
+
+                checkpoint = torch.load(
+                    checkpoint_path, map_location=device, weights_only=False
+                )
+                agent.load_state_dict(checkpoint["model_state_dict"])
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                start_episode = checkpoint["episode"]
+                ppo_round_counter = checkpoint.get("ppo_round_counter", 0)
+                print(
+                    f"Resumed from checkpoint {latest_checkpoint_artifact.path} in run {args.resume_run_id}"
+                )
+        except Exception as e:
+            print(f"Could not resume from run {args.resume_run_id}: {e}")
+
+    elif args.resume_from:
+        if not os.path.isfile(args.resume_from):
+            raise FileNotFoundError(f"Checkpoint not found at {args.resume_from}")
         checkpoint = torch.load(
             args.resume_from, map_location=device, weights_only=False
         )
         agent.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_episode = checkpoint["episode"]
-    else:
-        # Find the latest checkpoint in the new run-specific checkpoints directory
-        checkpoint_files = sorted(
-            glob.glob(os.path.join(checkpoints_dir, "checkpoint_*.pt"))
-        )
-        if checkpoint_files:
-            latest_checkpoint = checkpoint_files[-1]
-            checkpoint = torch.load(
-                latest_checkpoint, map_location=device, weights_only=False
-            )
-            agent.load_state_dict(checkpoint["model_state_dict"])
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            start_episode = checkpoint["episode"]
+        ppo_round_counter = checkpoint.get("ppo_round_counter", 0)
+        print(f"Resumed from checkpoint file: {args.resume_from}")
 
-    # Initialize TensorBoard writer
-    writer = SummaryWriter(log_dir=run_dir)
-    print(f"TensorBoard logs will be saved to: {run_dir}")
-    print(f"To view TensorBoard, run: tensorboard --logdir runs")
-    import socket
-
-    hostname = socket.gethostname()
-    ip_address = socket.gethostbyname(hostname)
-    print(f"TensorBoard running on: http://{ip_address}:6006")
+    # This print statement is removed as checkpoints are now handled by MLflow
+    # print(f"Checkpoints will be saved to: {run_dir}")
 
     rollout_states = []
     rollout_actions = []
@@ -242,6 +252,7 @@ if __name__ == "__main__":
     rollout_advantages = []
     rollout_returns = []
     episode_count = 0
+    ppo_round_counter = 0
 
     for episode in range(start_episode, config.NUM_EPISODES):
         (
@@ -250,7 +261,13 @@ if __name__ == "__main__":
             episode_log_probs,
             episode_values,
             episode_rewards,
-        ) = [], [], [], [], []
+        ) = (
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
         observation, info = env.reset()
         terminated, truncated = False, False
         agent.eval()
@@ -316,6 +333,13 @@ if __name__ == "__main__":
             value_std = values_tensor.std().item()
             mean_return = returns.mean().item()
 
+            print(
+                f"Episode: {episode + 1}/{config.NUM_EPISODES}, "
+                f"Reward: {total_reward:.2f}, "
+                f"Avg Return: {mean_return:.2f}, "
+                f"Steps: {steps}"
+            )
+
         if episode_count >= config.COLLECT_EPISODES:
             agent.train()
             states_batch = torch.cat(rollout_states)
@@ -379,27 +403,23 @@ if __name__ == "__main__":
             avg_entropy = total_entropy / num_updates
             avg_clip_fraction = total_clip_fraction / num_updates
             avg_reward = np.mean(rollout_rewards)
-            # Log hyperparameters and metrics
-            writer.add_hparams(
-                {k: getattr(config, k) for k in config.__annotations__.keys()},
-                {
-                    "hparam/avg_reward": avg_reward,
-                    "hparam/avg_actor_loss": avg_actor_loss,
-                    "hparam/avg_critic_loss": avg_critic_loss,
-                    "hparam/avg_entropy": avg_entropy,
-                },
+            ppo_round_counter += 1
+
+            # Log metrics to MLflow
+            mlflow.log_metric("Rewards/Total", total_reward, step=episode + 1)
+            mlflow.log_metric("Rewards/Average", avg_reward, step=episode + 1)
+            mlflow.log_metric("Losses/Actor", avg_actor_loss, step=episode + 1)
+            mlflow.log_metric("Losses/Critic", avg_critic_loss, step=episode + 1)
+            mlflow.log_metric("PPO/Entropy", avg_entropy, step=episode + 1)
+            mlflow.log_metric("PPO/Clip_Fraction", avg_clip_fraction, step=episode + 1)
+            mlflow.log_metric("Value_Function/Mean_Value", mean_value, step=episode + 1)
+            mlflow.log_metric(
+                "Value_Function/Value_StdDev", value_std, step=episode + 1
             )
-            # Log to TensorBoard
-            writer.add_scalar("Reward/TotalReward", total_reward, episode + 1)
-            writer.add_scalar("Reward/AvgReward", avg_reward, episode + 1)
-            writer.add_scalar("Loss/ActorLoss", avg_actor_loss, episode + 1)
-            writer.add_scalar("Loss/CriticLoss", avg_critic_loss, episode + 1)
-            writer.add_scalar("PPO/Entropy", avg_entropy, episode + 1)
-            writer.add_scalar("PPO/ClipFraction", avg_clip_fraction, episode + 1)
-            writer.add_scalar("Value/MeanValue", mean_value, episode + 1)
-            writer.add_scalar("Value/ValueStd", value_std, episode + 1)
-            writer.add_scalar("Value/MeanReturn", mean_return, episode + 1)
-            writer.add_scalar("Perf/Steps", steps, episode + 1)
+            mlflow.log_metric(
+                "Value_Function/Mean_Return", mean_return, step=episode + 1
+            )
+            mlflow.log_metric("Performance/Steps_per_Episode", steps, step=episode + 1)
 
             # Clear rollout buffers
             (
@@ -409,24 +429,37 @@ if __name__ == "__main__":
                 rollout_rewards,
                 rollout_advantages,
                 rollout_returns,
-            ) = [], [], [], [], [], []
+            ) = (
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+            )
             episode_count = 0
 
-            if (episode + 1) % config.CHECKPOINT_INTERVAL == 0:
+            if ppo_round_counter % config.CHECKPOINT_PPO_ROUNDS == 0:
                 checkpoint = {
                     "episode": episode + 1,
+                    "ppo_round_counter": ppo_round_counter,
                     "model_state_dict": agent.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "avg_reward": avg_reward,
                 }
-                checkpoint_path = os.path.join(
-                    checkpoints_dir, f"checkpoint_{episode + 1:07d}.pt"
+                with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
+                    torch.save(checkpoint, tmp.name)
+                    mlflow.log_artifact(
+                        tmp.name,
+                        artifact_path=f"checkpoints/checkpoint_ppo_round_{ppo_round_counter:07d}.pt",
+                    )
+                os.remove(tmp.name)  # Clean up the temporary file
+                print(
+                    f"Saved checkpoint for PPO round {ppo_round_counter} to MLflow artifacts."
                 )
-                torch.save(checkpoint, checkpoint_path)
 
         observation, info = env.reset()
 
-    writer.close()
     env.close()
     if not args.headless:
         cv2.destroyAllWindows()
@@ -436,5 +469,12 @@ if __name__ == "__main__":
         "model_state_dict": agent.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
     }
-    checkpoint_path = os.path.join(checkpoints_dir, f"checkpoint_{episode + 1:07d}.pt")
-    torch.save(checkpoint, checkpoint_path)
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
+        torch.save(checkpoint, tmp.name)
+        mlflow.log_artifact(
+            tmp.name,
+            artifact_path=f"checkpoints/checkpoint_{episode + 1:07d}.pt",
+        )
+    os.remove(tmp.name)  # Clean up the temporary file
+    print(f"Saved final checkpoint for episode {episode + 1} to MLflow artifacts.")
+    mlflow.end_run()

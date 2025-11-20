@@ -199,6 +199,108 @@ class TinyCNN(nn.Module):
         return action_logits, value
 
 
+class TinyCNNv2(nn.Module):
+    def __init__(self, num_actions=4, *args, **kwargs):
+        super().__init__()
+
+        self.block1 = nn.Sequential(
+            nn.Conv3d(
+                1,
+                32,
+                kernel_size=(3, 3, 3),
+                stride=(2, 2, 2),
+                padding=(1, 1, 1),
+                bias=False,
+            ),
+            nn.BatchNorm3d(32),
+        )
+        self.block2 = nn.Sequential(
+            nn.Conv3d(
+                32,
+                64,
+                kernel_size=(3, 3, 3),
+                stride=(2, 2, 2),
+                padding=(1, 1, 1),
+                bias=False,
+            ),
+            nn.BatchNorm3d(64),
+        )
+        self.block3 = nn.Sequential(
+            nn.Conv3d(
+                64,
+                128,
+                kernel_size=(3, 3, 3),
+                stride=(2, 2, 2),
+                padding=(1, 1, 1),
+                bias=False,
+            ),
+            nn.BatchNorm3d(128),
+        )
+
+        self.block4 = nn.Sequential(
+            nn.Conv3d(
+                128,
+                256,
+                kernel_size=(3, 3, 3),
+                stride=(2, 2, 2),
+                padding=(1, 1, 1),
+                bias=False,
+            ),
+            nn.BatchNorm3d(256),
+        )
+
+        # Skip connections
+        self.skip1 = nn.Conv3d(1, 32, kernel_size=1, stride=(2, 2, 2), bias=False)
+        self.skip2 = nn.Conv3d(32, 64, kernel_size=1, stride=(2, 2, 2), bias=False)
+        self.skip3 = nn.Conv3d(64, 128, kernel_size=1, stride=(2, 2, 2), bias=False)
+        self.skip4 = nn.Conv3d(
+            128, 256, kernel_size=1, stride=(2, 2, 2), bias=False
+        )
+
+        self.relu = nn.ReLU(inplace=True)
+        self.global_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.actor = nn.Linear(256, num_actions)
+        self.critic = nn.Linear(256, 1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Conv3d, nn.Linear)):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        # Orthogonal initialization for actor and critic layers
+        nn.init.orthogonal_(self.actor.weight, gain=0.01)
+        nn.init.zeros_(self.actor.bias)
+        nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        nn.init.zeros_(self.critic.bias)
+
+    def forward(self, x):
+        identity = self.skip1(x)
+        x = self.block1(x)
+        x = self.relu(x + identity)
+
+        identity = self.skip2(x)
+        x = self.block2(x)
+        x = self.relu(x + identity)
+
+        identity = self.skip3(x)
+        x = self.block3(x)
+        x = self.relu(x + identity)
+
+        identity = self.skip4(x)
+        x = self.block4(x)
+        x = self.relu(x + identity)
+
+        x = self.global_pool(x)
+        x = x.view(x.size(0), -1)
+        action_logits = self.actor(x)
+        value = self.critic(x)
+        return action_logits, value
+
+
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Testing on: {device}\n")
@@ -206,7 +308,7 @@ if __name__ == "__main__":
     num_actions = 4
     num_frames = 16
     img_size = 128
-    model = Conv3DTransformerNet(num_actions=num_actions).to(device)
+    model = TinyCNNv2(num_actions=num_actions).to(device)
 
     dummy_input = torch.randn(1, 1, 16, img_size, img_size).to(device)
     print(f"Input shape: {dummy_input.shape}")

@@ -1,11 +1,11 @@
 from dataclasses import dataclass
-from typing import Optional
+
 
 @dataclass
 class TrainingConfig:
     USE_MIXED_PRECISION: bool
     USE_TORCH_COMPILE: bool
-    CHECKPOINT_INTERVAL: int
+    CHECKPOINT_PPO_ROUNDS: int
     LEARNING_RATE: float
     GAMMA: float
     GAE_LAMBDA: float
