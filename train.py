@@ -124,13 +124,12 @@ if __name__ == "__main__":
         "--resume-from",
         type=str,
         default=None,
-        help="Path to a checkpoint file to resume training from.",
+        help="Path to a checkpoint file or directory to resume training from.",
     )
     parser.add_argument(
-        "--resume-run-id",
-        type=str,
-        default=None,
-        help="MLflow run ID to resume.",
+        "--auto-resume",
+        action="store_true",
+        help="Automatically resume training from the latest checkpoint in --checkpoint-dir.",
     )
     args = parser.parse_args()
 
@@ -140,6 +139,9 @@ if __name__ == "__main__":
 
     # Extract config name from path (e.g., "baseline" from "configs/baseline.yaml")
     config_name = os.path.splitext(os.path.basename(args.config))[0]
+
+    # Ensure checkpoint directory exists
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     # Setup MLflow
     mlflow.set_experiment(config_name)
@@ -202,48 +204,45 @@ if __name__ == "__main__":
     optimizer = optim.Adam(agent.parameters(), lr=config.LEARNING_RATE)
 
     start_episode = 0
-    if args.resume_run_id:
-        client = mlflow.tracking.MlflowClient()
-        # Get all artifacts from the 'checkpoints' directory
-        try:
-            artifacts = client.list_artifacts(args.resume_run_id, "checkpoints")
-            if artifacts:
-                # Sort artifacts by name (which includes the episode number) to find the latest
-                artifacts.sort(key=lambda x: x.path, reverse=True)
-                latest_checkpoint_artifact = artifacts[0]
+    resume_path = None
 
-                # Download the latest checkpoint
-                checkpoint_path = client.download_artifacts(
-                    run_id=args.resume_run_id, path=latest_checkpoint_artifact.path
-                )
+    if args.resume_from:
+        resume_path = args.resume_from
+    elif args.auto_resume:
+        resume_path = args.checkpoint_dir
 
-                checkpoint = torch.load(
-                    checkpoint_path, map_location=device, weights_only=False
-                )
-                agent.load_state_dict(checkpoint["model_state_dict"])
-                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                start_episode = checkpoint["episode"]
-                ppo_round_counter = checkpoint.get("ppo_round_counter", 0)
-                print(
-                    f"Resumed from checkpoint {latest_checkpoint_artifact.path} in run {args.resume_run_id}"
-                )
-        except Exception as e:
-            print(f"Could not resume from run {args.resume_run_id}: {e}")
+    if resume_path:
+        if os.path.isdir(resume_path):
+            checkpoint_files = [
+                os.path.join(resume_path, f)
+                for f in os.path.listdir(resume_path)
+                if f.endswith(".pt")
+            ]
+            if not checkpoint_files:
+                if args.auto_resume:
+                    print(f"No checkpoint files found in directory: {resume_path}. Starting new training run.")
+                    resume_path = None # Do not attempt to load from a non-existent directory
+                else:
+                    raise FileNotFoundError(
+                        f"No checkpoint files found in directory: {resume_path}"
+                    )
+            else:
+                checkpoint_files.sort()  # Sorts alphabetically, which works with our naming convention
+                resume_path = checkpoint_files[-1]  # Get the latest checkpoint
 
-    elif args.resume_from:
-        if not os.path.isfile(args.resume_from):
-            raise FileNotFoundError(f"Checkpoint not found at {args.resume_from}")
-        checkpoint = torch.load(
-            args.resume_from, map_location=device, weights_only=False
-        )
-        agent.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        start_episode = checkpoint["episode"]
-        ppo_round_counter = checkpoint.get("ppo_round_counter", 0)
-        print(f"Resumed from checkpoint file: {args.resume_from}")
+        if resume_path and not os.path.isfile(resume_path):
+            raise FileNotFoundError(f"Checkpoint not found at {resume_path}")
+        
+        if resume_path: # Only load if a valid resume_path was found
+            checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+            agent.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            start_episode = checkpoint["episode"]
+            ppo_round_counter = checkpoint.get("ppo_round_counter", 0)
+            print(f"Resumed from checkpoint file: {resume_path}")
 
     # This print statement is removed as checkpoints are now handled by MLflow
-    # print(f"Checkpoints will be saved to: {run_dir}")
+
 
     rollout_states = []
     rollout_actions = []
@@ -447,16 +446,12 @@ if __name__ == "__main__":
                     "optimizer_state_dict": optimizer.state_dict(),
                     "avg_reward": avg_reward,
                 }
-                with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
-                    torch.save(checkpoint, tmp.name)
-                    mlflow.log_artifact(
-                        tmp.name,
-                        artifact_path=f"checkpoints/checkpoint_ppo_round_{ppo_round_counter:07d}.pt",
-                    )
-                os.remove(tmp.name)  # Clean up the temporary file
-                print(
-                    f"Saved checkpoint for PPO round {ppo_round_counter} to MLflow artifacts."
+                checkpoint_filename = os.path.join(
+                    args.checkpoint_dir,
+                    f"checkpoint_ppo_round_{ppo_round_counter:07d}.pt",
                 )
+                torch.save(checkpoint, checkpoint_filename)
+                print(f"Saved checkpoint for PPO round {ppo_round_counter} to {checkpoint_filename}.")
 
         observation, info = env.reset()
 
@@ -469,12 +464,9 @@ if __name__ == "__main__":
         "model_state_dict": agent.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
     }
-    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
-        torch.save(checkpoint, tmp.name)
-        mlflow.log_artifact(
-            tmp.name,
-            artifact_path=f"checkpoints/checkpoint_{episode + 1:07d}.pt",
-        )
-    os.remove(tmp.name)  # Clean up the temporary file
-    print(f"Saved final checkpoint for episode {episode + 1} to MLflow artifacts.")
+    checkpoint_filename = os.path.join(
+        args.checkpoint_dir, f"checkpoint_final_episode_{episode + 1:07d}.pt"
+    )
+    torch.save(checkpoint, checkpoint_filename)
+    print(f"Saved final checkpoint for episode {episode + 1} to {checkpoint_filename}.")
     mlflow.end_run()
