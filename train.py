@@ -131,6 +131,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Automatically resume training from the latest checkpoint in --checkpoint-dir.",
     )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="checkpoints",
+        help="Automatically resume training from the latest checkpoint in --checkpoint-dir.",
+    )
+
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -145,15 +152,11 @@ if __name__ == "__main__":
 
     # Setup MLflow
     mlflow.set_experiment(config_name)
-    if args.resume_run_id:
-        run = mlflow.start_run(run_id=args.resume_run_id)
-        run_name = run.info.run_name
-    else:
-        run_name = (
-            args.run_name
-            or f"{config.model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
-        run = mlflow.start_run(run_name=run_name)
+    run_name = (
+        args.run_name
+        or f"{config.model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
+    run = mlflow.start_run(run_name=run_name)
     mlflow.log_params(config_dict)
 
     print(f"MLflow experiment '{config_name}' started with run '{run_name}'.")
@@ -215,13 +218,17 @@ if __name__ == "__main__":
         if os.path.isdir(resume_path):
             checkpoint_files = [
                 os.path.join(resume_path, f)
-                for f in os.path.listdir(resume_path)
+                for f in os.listdir(resume_path)
                 if f.endswith(".pt")
             ]
             if not checkpoint_files:
                 if args.auto_resume:
-                    print(f"No checkpoint files found in directory: {resume_path}. Starting new training run.")
-                    resume_path = None # Do not attempt to load from a non-existent directory
+                    print(
+                        f"No checkpoint files found in directory: {resume_path}. Starting new training run."
+                    )
+                    resume_path = (
+                        None  # Do not attempt to load from a non-existent directory
+                    )
                 else:
                     raise FileNotFoundError(
                         f"No checkpoint files found in directory: {resume_path}"
@@ -232,9 +239,11 @@ if __name__ == "__main__":
 
         if resume_path and not os.path.isfile(resume_path):
             raise FileNotFoundError(f"Checkpoint not found at {resume_path}")
-        
-        if resume_path: # Only load if a valid resume_path was found
-            checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+
+        if resume_path:  # Only load if a valid resume_path was found
+            checkpoint = torch.load(
+                resume_path, map_location=device, weights_only=False
+            )
             agent.load_state_dict(checkpoint["model_state_dict"])
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             start_episode = checkpoint["episode"]
@@ -242,7 +251,6 @@ if __name__ == "__main__":
             print(f"Resumed from checkpoint file: {resume_path}")
 
     # This print statement is removed as checkpoints are now handled by MLflow
-
 
     rollout_states = []
     rollout_actions = []
@@ -253,6 +261,7 @@ if __name__ == "__main__":
     episode_count = 0
     ppo_round_counter = 0
 
+    episode = start_episode - 1
     for episode in range(start_episode, config.NUM_EPISODES):
         (
             episode_states,
@@ -451,7 +460,9 @@ if __name__ == "__main__":
                     f"checkpoint_ppo_round_{ppo_round_counter:07d}.pt",
                 )
                 torch.save(checkpoint, checkpoint_filename)
-                print(f"Saved checkpoint for PPO round {ppo_round_counter} to {checkpoint_filename}.")
+                print(
+                    f"Saved checkpoint for PPO round {ppo_round_counter} to {checkpoint_filename}."
+                )
 
         observation, info = env.reset()
 
@@ -459,14 +470,15 @@ if __name__ == "__main__":
     if not args.headless:
         cv2.destroyAllWindows()
 
-    checkpoint = {
-        "episode": episode + 1,
-        "model_state_dict": agent.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-    }
-    checkpoint_filename = os.path.join(
-        args.checkpoint_dir, f"checkpoint_final_episode_{episode + 1:07d}.pt"
-    )
-    torch.save(checkpoint, checkpoint_filename)
-    print(f"Saved final checkpoint for episode {episode + 1} to {checkpoint_filename}.")
+    if episode >= start_episode:
+        checkpoint = {
+            "episode": episode + 1,
+            "model_state_dict": agent.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+        }
+        checkpoint_filename = os.path.join(
+            args.checkpoint_dir, f"checkpoint_final_episode_{episode + 1:07d}.pt"
+        )
+        torch.save(checkpoint, checkpoint_filename)
+        print(f"Saved final checkpoint for episode {episode + 1} to {checkpoint_filename}.")
     mlflow.end_run()
