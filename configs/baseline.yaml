@@ -1,7 +1,6 @@
 # Training and System Configuration
 USE_MIXED_PRECISION: True
 USE_TORCH_COMPILE: False
-HEADLESS: True
 LOG_FILE: "training_log_ppo.txt"
 CHECKPOINT_INTERVAL: 1000
 

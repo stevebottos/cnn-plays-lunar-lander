@@ -1,3 +1,9 @@
+archive/ 
+checkpoints/ 
+notes/ 
+.python-version 
+.uv.lock 
+
 # Python-generated files
 __pycache__/
 *.py[oc]
