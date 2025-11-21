@@ -1,7 +1,6 @@
 # Training and System Configuration
 USE_MIXED_PRECISION: True
 USE_TORCH_COMPILE: False
-CHECKPOINT_PPO_ROUNDS: 32
 
 # Environment Configuration
 env_name: "LunarLander-v3"

@@ -5,11 +5,10 @@ from dataclasses import dataclass
 class TrainingConfig:
     USE_MIXED_PRECISION: bool
     USE_TORCH_COMPILE: bool
-    CHECKPOINT_PPO_ROUNDS: int
     LEARNING_RATE: float
     GAMMA: float
     GAE_LAMBDA: float
-    NUM_EPISODES: int
+    NUM_ROUNDS: int
     VALUE_COEFF: float
     ENTROPY_COEFF: float
     REWARD_CLIP: float
