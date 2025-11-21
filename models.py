@@ -212,7 +212,7 @@ class TinyCNNv2(nn.Module):
                 padding=(1, 1, 1),
                 bias=False,
             ),
-            nn.BatchNorm3d(32),
+            nn.GroupNorm(8, 32),  # Only change: BatchNorm3d → GroupNorm
         )
         self.block2 = nn.Sequential(
             nn.Conv3d(
@@ -223,7 +223,7 @@ class TinyCNNv2(nn.Module):
                 padding=(1, 1, 1),
                 bias=False,
             ),
-            nn.BatchNorm3d(64),
+            nn.GroupNorm(8, 64),
         )
         self.block3 = nn.Sequential(
             nn.Conv3d(
@@ -234,9 +234,8 @@ class TinyCNNv2(nn.Module):
                 padding=(1, 1, 1),
                 bias=False,
             ),
-            nn.BatchNorm3d(128),
+            nn.GroupNorm(16, 128),
         )
-
         self.block4 = nn.Sequential(
             nn.Conv3d(
                 128,
@@ -246,18 +245,27 @@ class TinyCNNv2(nn.Module):
                 padding=(1, 1, 1),
                 bias=False,
             ),
-            nn.BatchNorm3d(256),
+            nn.GroupNorm(32, 256),
         )
 
-        # Skip connections
-        self.skip1 = nn.Conv3d(1, 32, kernel_size=1, stride=(2, 2, 2), bias=False)
-        self.skip2 = nn.Conv3d(32, 64, kernel_size=1, stride=(2, 2, 2), bias=False)
-        self.skip3 = nn.Conv3d(64, 128, kernel_size=1, stride=(2, 2, 2), bias=False)
-        self.skip4 = nn.Conv3d(
-            128, 256, kernel_size=1, stride=(2, 2, 2), bias=False
+        self.skip1 = nn.Sequential(
+            nn.Conv3d(1, 32, kernel_size=1, stride=(2, 2, 2), bias=False),
+            nn.GroupNorm(8, 32),
+        )
+        self.skip2 = nn.Sequential(
+            nn.Conv3d(32, 64, kernel_size=1, stride=(2, 2, 2), bias=False),
+            nn.GroupNorm(8, 64),
+        )
+        self.skip3 = nn.Sequential(
+            nn.Conv3d(64, 128, kernel_size=1, stride=(2, 2, 2), bias=False),
+            nn.GroupNorm(16, 128),
+        )
+        self.skip4 = nn.Sequential(
+            nn.Conv3d(128, 256, kernel_size=1, stride=(2, 2, 2), bias=False),
+            nn.GroupNorm(32, 256),
         )
 
-        self.relu = nn.ReLU(inplace=True)
+        self.act = nn.SiLU()
         self.global_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
         self.actor = nn.Linear(256, num_actions)
         self.critic = nn.Linear(256, 1)
@@ -270,8 +278,10 @@ class TinyCNNv2(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.GroupNorm, nn.BatchNorm3d)):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
 
-        # Orthogonal initialization for actor and critic layers
         nn.init.orthogonal_(self.actor.weight, gain=0.01)
         nn.init.zeros_(self.actor.bias)
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
@@ -280,24 +290,25 @@ class TinyCNNv2(nn.Module):
     def forward(self, x):
         identity = self.skip1(x)
         x = self.block1(x)
-        x = self.relu(x + identity)
+        x = self.act(x + identity)
 
         identity = self.skip2(x)
         x = self.block2(x)
-        x = self.relu(x + identity)
+        x = self.act(x + identity)
 
         identity = self.skip3(x)
         x = self.block3(x)
-        x = self.relu(x + identity)
+        x = self.act(x + identity)
 
         identity = self.skip4(x)
         x = self.block4(x)
-        x = self.relu(x + identity)
+        x = self.act(x + identity)
 
         x = self.global_pool(x)
         x = x.view(x.size(0), -1)
         action_logits = self.actor(x)
         value = self.critic(x)
+
         return action_logits, value
 
 

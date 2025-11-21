@@ -3,6 +3,8 @@ from dataclasses import dataclass
 
 @dataclass
 class TrainingConfig:
+    NORMALIZE_ADVANTAGES: bool
+    NORMALIZE_RETURNS: bool
     USE_MIXED_PRECISION: bool
     USE_TORCH_COMPILE: bool
     LEARNING_RATE: float

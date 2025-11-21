@@ -1,12 +1,7 @@
 # type: ignore
 from pathlib import Path
+import json
 import gymnasium as gym
-from gymnasium.wrappers import (
-    AddRenderObservation,
-    ResizeObservation,
-    GrayscaleObservation,
-    FrameStackObservation,
-)
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
@@ -16,10 +11,18 @@ import numpy as np
 import argparse
 import yaml
 import os
+import gc
 from datetime import datetime
 from models import Conv3DTransformerNet, Conv3dResNet, TinyCNN, TinyCNNv2
 from configs.config import TrainingConfig
-from collections import namedtuple
+from collections import namedtuple, deque
+import tracemalloc
+from gymnasium.wrappers import (
+    AddRenderObservation,
+    ResizeObservation,
+    GrayscaleObservation,
+    FrameStackObservation,
+)
 
 
 def load_config(config_path: str) -> TrainingConfig:
@@ -28,7 +31,7 @@ def load_config(config_path: str) -> TrainingConfig:
     return TrainingConfig(**config_dict), config_dict
 
 
-def calculate_gae(rewards, values, next_value, gamma, gae_lambda, device):
+def calculate_gae(rewards, values, next_value, dones, gamma, gae_lambda, device):
     advantages = []
     gae = 0
     rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
@@ -36,22 +39,35 @@ def calculate_gae(rewards, values, next_value, gamma, gae_lambda, device):
         next_value = torch.tensor(next_value, dtype=torch.float32, device=device)
     elif next_value.dim() > 0:
         next_value = next_value.squeeze()
+
     values_list = torch.cat([values, next_value.unsqueeze(0)])
+    dones = torch.tensor(dones, dtype=torch.float32, device=device)
+
     for t in reversed(range(len(rewards))):
-        delta = rewards[t] + gamma * values_list[t + 1] - values_list[t]
-        gae = delta + gamma * gae_lambda * gae
-        advantages.insert(0, gae)
+        mask = 1.0 - dones[t]
+        delta = rewards[t] + gamma * values_list[t + 1] * mask - values_list[t]
+        gae = delta + gamma * gae_lambda * mask * gae
+        advantages.insert(0, gae.detach())  # CRITICAL: Detach to break gradient chain
+
     advantages = torch.stack(advantages)
-    returns = advantages + values
+    returns = (advantages + values).detach()
+
+    del rewards, values_list, next_value, dones, gae, delta
     return advantages, returns
 
 
 class PPOManager:
     def __init__(self, config):
         self.config = config
-
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.agent = self._get_model().to(self.device)
+
+        try:
+            state_dict = torch.load("/home/steve/repos/rl-stuff/checkpoints/0000250.pt")
+            self.agent.load_state_dict(state_dict)
+        except:
+            print("Unable to load from checkpoint.")
+
         self.optimizer = optim.Adam(self.agent.parameters(), lr=config.LEARNING_RATE)
         self.env = self._get_env()
 
@@ -69,6 +85,11 @@ class PPOManager:
         self.scaler = scaler
         self.episode_count = 0
 
+        # Running statistics for return normalization
+        self.return_rms_mean = 0.0
+        self.return_rms_var = 1.0
+        self.return_rms_count = 1e-4
+
     def _get_model(self):
         if config.model_name == "TinyCNN":
             agent = TinyCNN(num_actions=4)
@@ -76,39 +97,53 @@ class PPOManager:
             agent = TinyCNNv2(num_actions=4)
         elif config.model_name == "Conv3dResNet":
             agent = Conv3dResNet(num_actions=4)
-        # elif config.model_name == "Conv3DTransformerNet":
-        #     agent = Conv3DTransformerNet(num_actions=4, num_frames=config.NUM_FRAMES)
         else:
             raise ValueError(f"Unknown model_name: {config.model_name}")
 
-        # TODO: rework this, only works for transformer
         if config.USE_TORCH_COMPILE:
             try:
                 agent = torch.compile(agent, mode="reduce-overhead")
             except Exception:
-                pass  # Keep silent if compilation fails
-
+                pass
         return agent
 
     def _get_env(self):
         env = gym.make(
-            config.env_name,
+            "LunarLander-v3",
             render_mode="rgb_array",
-            max_episode_steps=config.MAX_EPISODE_STEPS,
+            max_episode_steps=250,
         )
-        # This is always 4 for lunar lander so who cares right now
-        # NUM_ACTIONS = env.action_space.n
         env = AddRenderObservation(env)
-        env = ResizeObservation(env, shape=(config.IMAGE_SIZE, config.IMAGE_SIZE))
+        env = ResizeObservation(env, (128, 128))
         env = GrayscaleObservation(env, keep_dim=True)
-        env = FrameStackObservation(env, config.NUM_FRAMES)
-
+        env = FrameStackObservation(env, 16)
         return env
+
+    def close(self):
+        self.env.close()
+
+    def update_return_rms(self, returns):
+        """Update running mean and std for return normalization"""
+        batch_mean = returns.mean().item()
+        batch_var = returns.var().item()
+        batch_count = len(returns)
+
+        delta = batch_mean - self.return_rms_mean
+        total_count = self.return_rms_count + batch_count
+
+        new_mean = self.return_rms_mean + delta * batch_count / total_count
+        m_a = self.return_rms_var * self.return_rms_count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta**2 * self.return_rms_count * batch_count / total_count
+        new_var = M2 / total_count
+
+        self.return_rms_mean = new_mean
+        self.return_rms_var = new_var
+        self.return_rms_count = total_count
 
     @torch.no_grad()
     def get_rollout(self):
         self.agent.eval()
-
         episode = namedtuple(
             "Episode",
             [
@@ -120,131 +155,174 @@ class PPOManager:
                 "returns",
             ],
         )
-
         rollout_buffer = []
+
         for i in range(self.config.COLLECT_EPISODES):
             episode_states = []
             episode_actions = []
             episode_log_probs = []
             episode_values = []
             episode_rewards = []
+            episode_dones = []
+
             observation, info = self.env.reset()
             terminated, truncated = False, False
             steps = 0
 
             while not terminated and not truncated:
-                image_tensor = torch.from_numpy(observation).permute(3, 0, 1, 2).float()
+                image_tensor = (
+                    torch.from_numpy(observation)
+                    .permute(3, 0, 1, 2)
+                    .float()
+                    .unsqueeze(0)
+                )
                 input_tensor = image_tensor.to(self.device) / 255.0
-                episode_states.append(input_tensor.cpu())
+                episode_states.append(input_tensor.detach().cpu())
+
                 with torch.amp.autocast(
                     "cuda", enabled=config.USE_MIXED_PRECISION, dtype=self.dtype
                 ):
-                    action_logits, value = self.agent(input_tensor.unsqueeze(0))
+                    action_logits, value = self.agent(input_tensor)
 
                 action_dist = Categorical(logits=action_logits.float())
                 action = action_dist.sample()
+                log_prob = action_dist.log_prob(action)
+
                 episode_actions.append(action.detach().cpu())
-                episode_log_probs.append(action_dist.log_prob(action).detach().cpu())
+                episode_log_probs.append(log_prob.detach().cpu())
                 episode_values.append(value.squeeze(-1).detach().cpu())
+
                 observation, reward, terminated, truncated, info = self.env.step(
                     action.item()
                 )
-                clipped_reward = np.clip(
-                    reward, -config.REWARD_CLIP, config.REWARD_CLIP
-                )
-                episode_rewards.append(clipped_reward)
+                episode_rewards.append(reward)
+                episode_dones.append(terminated)
                 steps += 1
 
             if episode_rewards:
                 if terminated:
-                    next_value = torch.tensor(0.0, device=self.device)
+                    next_value = torch.tensor(0.0, device="cpu")
                 else:
                     image_tensor = (
-                        torch.from_numpy(observation).permute(3, 0, 1, 2).float()
+                        torch.from_numpy(observation)
+                        .permute(3, 0, 1, 2)
+                        .float()
+                        .unsqueeze(0)
                     )
                     input_tensor = image_tensor.to(self.device) / 255.0
                     with torch.amp.autocast(
                         "cuda", enabled=config.USE_MIXED_PRECISION, dtype=self.dtype
                     ):
-                        with torch.no_grad():
-                            _, next_value = self.agent(input_tensor.unsqueeze(0))
-                            next_value = next_value.squeeze(-1).detach()
+                        _, next_value = self.agent(input_tensor)
+                        next_value = next_value.squeeze(-1).detach().cpu()
+                    del image_tensor, input_tensor
 
                 values_tensor = torch.cat(episode_values)
                 advantages, returns = calculate_gae(
                     episode_rewards,
-                    values_tensor.to(self.device),
-                    next_value,
+                    values_tensor,
+                    next_value if not terminated else 0.0,
+                    episode_dones,
                     config.GAMMA,
                     config.GAE_LAMBDA,
-                    self.device,
+                    "cpu",
                 )
-            rollout_buffer.append(
-                episode(
-                    states=episode_states,
-                    actions=episode_actions,
-                    log_probs=episode_log_probs,
-                    rewards=episode_rewards,
-                    advantages=advantages,
-                    returns=returns,
-                )
-            )
-            total_reward = sum(episode_rewards)
-            mean_return = returns.mean().item()
 
-            print(
-                f"Episode: {self.episode_count}, "
-                f"Reward: {total_reward:.2f}, "
-                f"Avg Return: {mean_return:.2f}, "
-                f"Steps: {steps}"
-            )
-            self.episode_count += 1
+                print(f"Episode reward: {sum(episode_rewards):.2f}")
+
+                rollout_buffer.append(
+                    episode(
+                        states=episode_states,
+                        actions=episode_actions,
+                        log_probs=episode_log_probs,
+                        rewards=episode_rewards,
+                        advantages=advantages,
+                        returns=returns,
+                    )
+                )
+
+                del (
+                    episode_states,
+                    episode_actions,
+                    episode_log_probs,
+                    episode_values,
+                    episode_rewards,
+                    episode_dones,
+                    values_tensor,
+                    advantages,
+                    returns,
+                    next_value,
+                )
+
+                self.episode_count += 1
 
         return rollout_buffer
 
     def ppo_update(self, rollout_buffer):
         self.agent.train()
 
-        # 1. Aggregate data from rollout buffer
-        states_batch = torch.stack(
-            [s for ep in rollout_buffer for s in ep.states]
-        ).cpu()
-        actions_batch = torch.cat(
-            [torch.tensor(ep.actions) for ep in rollout_buffer]
-        ).cpu()
-        old_log_probs_batch = torch.stack(
-            [lp for ep in rollout_buffer for lp in ep.log_probs]
-        ).cpu()
-        advantages_batch = torch.cat([ep.advantages for ep in rollout_buffer]).cpu()
-        returns_batch = torch.cat([ep.returns for ep in rollout_buffer]).cpu()
-
-        # 2. Normalize advantages
-        advantages_batch = (advantages_batch - advantages_batch.mean()) / (
-            advantages_batch.std() + 1e-8
+        # Aggregate data from rollout buffer
+        states_batch = torch.cat(
+            [torch.stack(ep.states) for ep in rollout_buffer], dim=0
         )
+        actions_batch = torch.cat(
+            [torch.stack(ep.actions) for ep in rollout_buffer], dim=0
+        )
+        old_log_probs_batch = torch.cat(
+            [torch.stack(ep.log_probs) for ep in rollout_buffer], dim=0
+        )
+        advantages_batch = torch.cat([ep.advantages for ep in rollout_buffer], dim=0)
+        returns_batch = torch.cat([ep.returns for ep in rollout_buffer], dim=0)
+
+        # Store raw advantages for normalization in the epoch loop
+        advantages_raw = advantages_batch.clone()
+
+        # Update running statistics and normalize returns
+        if self.config.NORMALIZE_RETURNS:
+            self.update_return_rms(returns_batch)
+            mean = torch.tensor(self.return_rms_mean)
+            std = torch.sqrt(torch.tensor(self.return_rms_var))
+            returns_batch_norm = (returns_batch - mean) / (std + 1e-8)
+        else:
+            returns_batch_norm = returns_batch
+
+        if self.config.NORMALIZE_ADVANTAGES:
+            # Standard PPO: zero mean, unit variance
+            adv_mean = advantages_raw.mean()
+            adv_std = advantages_raw.std()
+            advantages_batch = (advantages_raw - adv_mean) / (adv_std + 1e-8)
+        else:
+            # Just use raw advantages (not recommended, but if you insist)
+            advantages_batch = advantages_raw
 
         total_actor_loss = 0
         total_critic_loss = 0
+        total_entropy = 0
+        total_ratio_mean = 0
+        total_value_mean = 0
+        total_clip_fraction = 0
+        total_advantage_mean = 0
+        total_advantage_std = 0
         num_updates = 0
+
         dataset_size = len(states_batch)
         indices = np.arange(dataset_size)
 
-        # 3. PPO Epochs loop
+        # PPO Epochs loop
         for epoch in range(self.config.PPO_EPOCHS):
-            # 4. Shuffle indices
             np.random.shuffle(indices)
 
-            # 5. Mini-batch loop
+            # Mini-batch loop
             for start in range(0, dataset_size, self.config.BATCH_SIZE):
                 end = start + self.config.BATCH_SIZE
                 batch_indices = indices[start:end]
 
-                # 6. Get mini-batch data
-                states_mb = states_batch[batch_indices].to(self.device)
+                # Get mini-batch data
+                states_mb = states_batch[batch_indices].to(self.device).squeeze(1)
                 actions_mb = actions_batch[batch_indices].to(self.device)
                 old_log_probs_mb = old_log_probs_batch[batch_indices].to(self.device)
                 advantages_mb = advantages_batch[batch_indices].to(self.device)
-                returns_mb = returns_batch[batch_indices].to(self.device)
+                returns_mb = returns_batch_norm[batch_indices].to(self.device)
 
                 with torch.amp.autocast(
                     "cuda", enabled=self.config.USE_MIXED_PRECISION, dtype=self.dtype
@@ -253,6 +331,8 @@ class PPOManager:
                     action_dist = Categorical(logits=action_logits)
                     log_probs = action_dist.log_prob(actions_mb)
                     entropy = action_dist.entropy().mean()
+
+                    # Actor loss with PPO clipping
                     ratio = torch.exp(log_probs - old_log_probs_mb)
                     surr1 = ratio * advantages_mb
                     surr2 = (
@@ -264,42 +344,83 @@ class PPOManager:
                         * advantages_mb
                     )
                     actor_loss = -torch.min(surr1, surr2).mean()
-                    critic_loss = (
-                        F.smooth_l1_loss(values.squeeze(-1), returns_mb)
-                        * self.config.VALUE_COEFF
+
+                    # Track clipping statistics
+                    clip_fraction = (
+                        ((ratio - 1.0).abs() > self.config.CLIP_EPSILON).float().mean()
                     )
+
+                    # Critic loss
+                    critic_loss = F.mse_loss(values.squeeze(-1), returns_mb)
+
+                    # Total loss
                     total_loss = (
-                        actor_loss + critic_loss - entropy * self.config.ENTROPY_COEFF
+                        actor_loss
+                        + self.config.VALUE_COEFF * critic_loss
+                        - self.config.ENTROPY_COEFF * entropy
                     )
 
                 self.optimizer.zero_grad()
                 if self.scaler:
                     self.scaler.scale(total_loss).backward()
                     self.scaler.unscale_(self.optimizer)
-                else:
-                    total_loss.backward()
-
-                torch.nn.utils.clip_grad_norm_(self.agent.parameters(), 0.5)
-
-                if self.scaler:
+                    torch.nn.utils.clip_grad_norm_(self.agent.parameters(), 1.0)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
+                    total_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.agent.parameters(), 1.0)
                     self.optimizer.step()
 
                 total_actor_loss += actor_loss.item()
                 total_critic_loss += critic_loss.item()
+                total_entropy += entropy.item()
+                total_ratio_mean += ratio.mean().item()
+                total_value_mean += values.mean().item()
+                total_clip_fraction += clip_fraction.item()
+                total_advantage_mean += advantages_mb.mean().item()
+                total_advantage_std += advantages_mb.std().item()
                 num_updates += 1
 
-        return total_actor_loss / num_updates, total_critic_loss / num_updates
+                del states_mb, actions_mb, old_log_probs_mb, advantages_mb, returns_mb
+                del action_logits, values, action_dist, log_probs, entropy
+                del ratio, surr1, surr2, actor_loss, critic_loss, total_loss
+
+        del (
+            states_batch,
+            actions_batch,
+            old_log_probs_batch,
+            advantages_batch,
+            advantages_raw,
+            returns_batch,
+            returns_batch_norm,
+            indices,
+        )
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return {
+            "actor_loss": total_actor_loss / num_updates,
+            "critic_loss": total_critic_loss / num_updates,
+            "entropy": total_entropy / num_updates,
+            "ratio_mean": total_ratio_mean / num_updates,
+            "value_mean": total_value_mean / num_updates,
+            "clip_fraction": total_clip_fraction / num_updates,
+            "advantage_mean": total_advantage_mean / num_updates,
+            "advantage_std": total_advantage_std / num_updates,
+        }
 
 
 if __name__ == "__main__":
+    tracemalloc.start()
     parser = argparse.ArgumentParser(description="PPO Training Script")
     parser.add_argument(
         "--config", type=str, required=True, help="Path to the config file"
     )
     args = parser.parse_args()
+
     config, config_as_dict = load_config(args.config)
     config_name = os.path.splitext(os.path.basename(args.config))[0]
 
@@ -311,18 +432,82 @@ if __name__ == "__main__":
     run_name = f"{config.model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run = mlflow.start_run(run_name=run_name)
     mlflow.log_params(config_as_dict)
-
     print(f"MLflow experiment '{config_name}' started with run '{run_name}'.")
 
     manager = PPOManager(config)
+
+    # FIXED: Use separate dict for storing run history
+    run_history = {}
+
     for round in range(config.NUM_ROUNDS):
         rollout_buffer = manager.get_rollout()
-        actor_loss, critic_loss = manager.ppo_update(rollout_buffer)
-        avg_reward = np.mean([np.sum(ep.rewards) for ep in rollout_buffer])
-        mlflow.log_metric("Rewards/Average", avg_reward, step=round + 1)
-        mlflow.log_metric("Losses/Actor", actor_loss, step=round + 1)
-        mlflow.log_metric("Losses/Critic", critic_loss, step=round + 1)
 
-        if round % 250 == 0:
+        # Calculate metrics BEFORE ppo_update
+        avg_reward = np.mean([np.sum(ep.rewards) for ep in rollout_buffer])
+        avg_episode_length = np.mean([len(ep.rewards) for ep in rollout_buffer])
+
+        # Update policy
+        train_metrics = manager.ppo_update(rollout_buffer)
+
+        del rollout_buffer
+        gc.collect()
+
+        # Log metrics to MLflow
+        mlflow.log_metric("Rewards/Average", avg_reward, step=round + 1)
+        mlflow.log_metric("Episode/Length", avg_episode_length, step=round + 1)
+        mlflow.log_metric("Losses/Actor", train_metrics["actor_loss"], step=round + 1)
+        mlflow.log_metric("Losses/Critic", train_metrics["critic_loss"], step=round + 1)
+        mlflow.log_metric("Metrics/Entropy", train_metrics["entropy"], step=round + 1)
+        mlflow.log_metric(
+            "Metrics/Ratio_Mean", train_metrics["ratio_mean"], step=round + 1
+        )
+        mlflow.log_metric(
+            "Metrics/Value_Mean", train_metrics["value_mean"], step=round + 1
+        )
+        mlflow.log_metric(
+            "Metrics/Clip_Fraction", train_metrics["clip_fraction"], step=round + 1
+        )
+        mlflow.log_metric(
+            "Metrics/Advantage_Mean", train_metrics["advantage_mean"], step=round + 1
+        )
+        mlflow.log_metric(
+            "Metrics/Advantage_Std", train_metrics["advantage_std"], step=round + 1
+        )
+
+        # Print progress
+        if round % 10 == 0:
+            print(
+                f"Round {round}: "
+                f"Reward={avg_reward:.2f}, "
+                f"Entropy={train_metrics['entropy']:.4f}, "
+                f"Actor Loss={train_metrics['actor_loss']:.4f}, "
+                f"Critic Loss={train_metrics['critic_loss']:.4f}, "
+                f"Clip%={train_metrics['clip_fraction'] * 100:.1f}, "
+                f"Adv(μ={train_metrics['advantage_mean']:.3f}, σ={train_metrics['advantage_std']:.3f})"
+            )
+
+        # Store metrics in history
+        run_history[round] = {
+            "Rewards/Average": avg_reward,
+            "Episode/Length": avg_episode_length,
+            "Losses/Actor": train_metrics["actor_loss"],
+            "Losses/Critic": train_metrics["critic_loss"],
+            "Metrics/Entropy": train_metrics["entropy"],
+            "Metrics/Ratio_Mean": train_metrics["ratio_mean"],
+            "Metrics/Value_Mean": train_metrics["value_mean"],
+            "Metrics/Clip_Fraction": train_metrics["clip_fraction"],
+            "Metrics/Advantage_Mean": train_metrics["advantage_mean"],
+            "Metrics/Advantage_Std": train_metrics["advantage_std"],
+        }
+
+        # Save run history
+        with open("run.json", "w") as f:
+            json.dump(run_history, f, indent=2)
+
+        if round % 50 == 0:
             checkpoint_path = checkpoints_out / f"{str(round).zfill(7)}.pt"
             torch.save(manager.agent.state_dict(), str(checkpoint_path))
+
+    manager.close()
+    mlflow.end_run()
+    tracemalloc.stop()
