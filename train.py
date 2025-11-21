@@ -250,8 +250,6 @@ if __name__ == "__main__":
             ppo_round_counter = checkpoint.get("ppo_round_counter", 0)
             print(f"Resumed from checkpoint file: {resume_path}")
 
-    # This print statement is removed as checkpoints are now handled by MLflow
-
     rollout_states = []
     rollout_actions = []
     rollout_log_probs = []
@@ -480,5 +478,7 @@ if __name__ == "__main__":
             args.checkpoint_dir, f"checkpoint_final_episode_{episode + 1:07d}.pt"
         )
         torch.save(checkpoint, checkpoint_filename)
-        print(f"Saved final checkpoint for episode {episode + 1} to {checkpoint_filename}.")
+        print(
+            f"Saved final checkpoint for episode {episode + 1} to {checkpoint_filename}."
+        )
     mlflow.end_run()
