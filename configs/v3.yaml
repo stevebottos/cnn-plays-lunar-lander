@@ -7,10 +7,10 @@ env_name: "LunarLander-v3"
 IMAGE_SIZE: 128
 NUM_FRAMES: 16
 MAX_EPISODE_STEPS: 500
-REWARD_CLIP: 1000.0 # basically no reward clipping
+REWARD_CLIP: 1000.0  # basically no reward clipping
 
 # Model Configuration
-model_name: "Conv3DTransformerNet"
+model_name: "TinyCNNv3"
 
 # PPO Hyperparameters
 LEARNING_RATE: 0.0003
@@ -21,7 +21,7 @@ ENTROPY_COEFF: 0.003
 CLIP_EPSILON: 0.2
 PPO_EPOCHS: 2
 COLLECT_EPISODES: 32
-BATCH_SIZE: 64
+BATCH_SIZE: 128
 NORMALIZE_ADVANTAGES: True  # Always recommend true
-NORMALIZE_RETURNS: True     # Can experiment with false
+NORMALIZE_RETURNS: True  # Can experiment with false
 NUM_ROUNDS: 10000

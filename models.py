@@ -56,27 +56,25 @@ class Conv3DTransformerNet(nn.Module):
         self.num_actions = num_actions
         self.num_frames = num_frames
 
+        self.embed_dim = 256
+        self.seq_len = 256
+
         self.conv3d_stem = nn.Sequential(
-            nn.Conv3d(1, 64, kernel_size=(8, 16, 16), stride=(4, 16, 16)),
+            nn.Conv3d(1, self.embed_dim, kernel_size=(4, 16, 16), stride=(4, 16, 16)),
         )
-
-        self.seq_len = 192
-        self.embed_dim = 64
-
-        self.pos_embed = nn.Parameter(
+        self.pos_embed = torch.nn.Parameter(
             torch.randn(1, self.seq_len, self.embed_dim) * 0.02
         )
-
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.embed_dim,
-            nhead=4,
+            nhead=8,
             dim_feedforward=256,
-            dropout=0.1,
+            dropout=0.0,
             activation="gelu",
             batch_first=True,
             norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=8)
 
         self.norm = nn.LayerNorm(self.embed_dim)
         self.actor = nn.Linear(self.embed_dim, num_actions)
@@ -312,6 +310,97 @@ class TinyCNNv2(nn.Module):
         return action_logits, value
 
 
+class TinyCNNv3(nn.Module):
+    def __init__(self, num_actions=4, *args, **kwargs):
+        super(TinyCNNv3, self).__init__()
+
+        # Initial conv to reduce temporal dimension
+        self.conv1 = nn.Conv3d(
+            1, 32, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)
+        )
+        self.bn1 = nn.BatchNorm3d(32)
+        self.temporal_pool1 = nn.MaxPool3d(kernel_size=(4, 1, 1), stride=(4, 1, 1))
+
+        self.conv2 = nn.Conv3d(
+            32, 64, kernel_size=(1, 4, 4), stride=(1, 2, 2), padding=(0, 1, 1)
+        )
+        self.bn2 = nn.BatchNorm3d(64)
+        self.skip2 = nn.Conv3d(32, 64, kernel_size=1, stride=(1, 2, 2))
+        self.temporal_pool2 = nn.MaxPool3d(kernel_size=(4, 1, 1), stride=(4, 1, 1))
+
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.skip3 = nn.Conv2d(64, 128, kernel_size=1, stride=2)
+
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.skip4 = nn.Conv2d(128, 256, kernel_size=1, stride=2)
+
+        self.conv5 = nn.Conv2d(256, 256, kernel_size=4, stride=2, padding=1)
+        self.bn5 = nn.BatchNorm2d(256)
+        self.skip5 = nn.Conv2d(256, 256, kernel_size=1, stride=2)
+
+        # Changed: Replaced AdaptiveAvgPool2d with Flatten
+        self.flatten = nn.Flatten()
+        self.feature_extractor_output_size = (
+            256 * 4 * 4
+        )  # 256 channels * 4x4 spatial dimensions
+
+        self.relu = nn.ReLU(inplace=True)
+
+        # Updated linear layers to match the new flattened output size
+        self.actor = nn.Linear(self.feature_extractor_output_size, num_actions)
+        self.critic = nn.Linear(self.feature_extractor_output_size, 1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Conv3d, nn.Linear)):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        # Orthogonal initialization for actor and critic layers
+        nn.init.orthogonal_(self.actor.weight, gain=0.01)
+        nn.init.zeros_(self.actor.bias)
+        nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        nn.init.zeros_(self.critic.bias)
+
+    def forward(self, x):
+        # First 3D convolutions to process temporal + spatial info
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.temporal_pool1(x)
+
+        identity = self.skip2(x)
+        x = self.bn2(self.conv2(x))
+        x = self.relu(x + identity)  # Skip connection
+        x = self.temporal_pool2(x)
+
+        # Remove temporal dimension
+        x = x.squeeze(2)
+
+        # 2D convolutions with skip connections
+        identity = self.skip3(x)
+        x = self.bn3(self.conv3(x))
+        x = self.relu(x + identity)
+
+        identity = self.skip4(x)
+        x = self.bn4(self.conv4(x))
+        x = self.relu(x + identity)
+
+        identity = self.skip5(x)
+        x = self.bn5(self.conv5(x))
+        x = self.relu(x + identity)
+
+        # Flatten instead of Global pooling
+        x = self.flatten(x)
+
+        action_logits = self.actor(x)
+        value = self.critic(x)
+        return action_logits, value
+
+
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Testing on: {device}\n")
@@ -319,9 +408,8 @@ if __name__ == "__main__":
     num_actions = 4
     num_frames = 16
     img_size = 128
-    model = TinyCNNv2(num_actions=num_actions).to(device)
-
     dummy_input = torch.randn(1, 1, 16, img_size, img_size).to(device)
+    model = Conv3DTransformerNet(num_actions=num_actions).to(device)
     print(f"Input shape: {dummy_input.shape}")
 
     action_logits, value = model(dummy_input)

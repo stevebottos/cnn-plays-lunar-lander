@@ -13,7 +13,7 @@ import yaml
 import os
 import gc
 from datetime import datetime
-from models import Conv3DTransformerNet, Conv3dResNet, TinyCNN, TinyCNNv2
+from models import Conv3DTransformerNet, Conv3dResNet, TinyCNN, TinyCNNv2, TinyCNNv3
 from configs.config import TrainingConfig
 from collections import namedtuple, deque
 import tracemalloc
@@ -29,6 +29,12 @@ def load_config(config_path: str) -> TrainingConfig:
     with open(config_path, "r") as f:
         config_dict = yaml.safe_load(f)
     return TrainingConfig(**config_dict), config_dict
+
+
+def memops():
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_flash_sdp(True)
 
 
 def calculate_gae(rewards, values, next_value, dones, gamma, gae_lambda, device):
@@ -63,7 +69,7 @@ class PPOManager:
         self.agent = self._get_model().to(self.device)
 
         try:
-            state_dict = torch.load("/home/steve/repos/rl-stuff/checkpoints/0000250.pt")
+            state_dict = torch.load("checkpoints/STARTER.pt")
             self.agent.load_state_dict(state_dict)
         except:
             print("Unable to load from checkpoint.")
@@ -95,8 +101,13 @@ class PPOManager:
             agent = TinyCNN(num_actions=4)
         elif config.model_name == "TinyCNNv2":
             agent = TinyCNNv2(num_actions=4)
+        elif config.model_name == "TinyCNNv3":
+            agent = TinyCNNv3(num_actions=4)
         elif config.model_name == "Conv3dResNet":
             agent = Conv3dResNet(num_actions=4)
+        elif config.model_name == "Conv3DTransformerNet":
+            agent = Conv3DTransformerNet(num_actions=4)
+            memops()
         else:
             raise ValueError(f"Unknown model_name: {config.model_name}")
 
@@ -295,6 +306,13 @@ class PPOManager:
             # Just use raw advantages (not recommended, but if you insist)
             advantages_batch = advantages_raw
 
+        # Calculate explained variance
+        values_batch = returns_batch - advantages_batch
+        explained_var = 1 - torch.var(returns_batch - values_batch) / (
+            torch.var(returns_batch) + 1e-8
+        )
+        # Removed direct mlflow.log_metric for Explained_Variance, now returned and logged in main loop
+
         total_actor_loss = 0
         total_critic_loss = 0
         total_entropy = 0
@@ -303,6 +321,7 @@ class PPOManager:
         total_clip_fraction = 0
         total_advantage_mean = 0
         total_advantage_std = 0
+        total_approx_kl = 0  # ADDED: Initialization for approximate KL divergence
         num_updates = 0
 
         dataset_size = len(states_batch)
@@ -334,6 +353,11 @@ class PPOManager:
 
                     # Actor loss with PPO clipping
                     ratio = torch.exp(log_probs - old_log_probs_mb)
+
+                    # Calculate Approximate KL Divergence
+                    with torch.no_grad():
+                        approx_kl = ((ratio - 1) - torch.log(ratio)).mean().item()
+                    total_approx_kl += approx_kl
                     surr1 = ratio * advantages_mb
                     surr2 = (
                         torch.clamp(
@@ -410,6 +434,8 @@ class PPOManager:
             "clip_fraction": total_clip_fraction / num_updates,
             "advantage_mean": total_advantage_mean / num_updates,
             "advantage_std": total_advantage_std / num_updates,
+            "approx_kl": total_approx_kl / num_updates,
+            "explained_variance": explained_var.item(),
         }
 
 
@@ -427,6 +453,12 @@ if __name__ == "__main__":
     checkpoints_out = Path("checkpoints")
     checkpoints_out.mkdir(parents=True, exist_ok=True)
 
+    # Recreate run.jsonl at the start of each run
+    jsonl_file_path = "run.jsonl"
+    if os.path.exists(jsonl_file_path):
+        os.remove(jsonl_file_path)
+        print(f"Recreated {jsonl_file_path} for new run.")
+
     # Setup MLflow
     mlflow.set_experiment(config_name)
     run_name = f"{config.model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -435,9 +467,6 @@ if __name__ == "__main__":
     print(f"MLflow experiment '{config_name}' started with run '{run_name}'.")
 
     manager = PPOManager(config)
-
-    # FIXED: Use separate dict for storing run history
-    run_history = {}
 
     for round in range(config.NUM_ROUNDS):
         rollout_buffer = manager.get_rollout()
@@ -473,6 +502,14 @@ if __name__ == "__main__":
         mlflow.log_metric(
             "Metrics/Advantage_Std", train_metrics["advantage_std"], step=round + 1
         )
+        mlflow.log_metric(
+            "Metrics/Approx_KL", train_metrics["approx_kl"], step=round + 1
+        )
+        mlflow.log_metric(
+            "Metrics/Explained_Variance",
+            train_metrics["explained_variance"],
+            step=round + 1,
+        )
 
         # Print progress
         if round % 10 == 0:
@@ -483,11 +520,13 @@ if __name__ == "__main__":
                 f"Actor Loss={train_metrics['actor_loss']:.4f}, "
                 f"Critic Loss={train_metrics['critic_loss']:.4f}, "
                 f"Clip%={train_metrics['clip_fraction'] * 100:.1f}, "
-                f"Adv(μ={train_metrics['advantage_mean']:.3f}, σ={train_metrics['advantage_std']:.3f})"
+                f"Adv(μ={train_metrics['advantage_mean']:.3f}, σ={train_metrics['advantage_std']:.3f}), "
+                f"KL={train_metrics['approx_kl']:.3f}, ExpVar={train_metrics['explained_variance']:.3f})"
             )
 
-        # Store metrics in history
-        run_history[round] = {
+        # Create log entry for the current round and append to jsonl file
+        current_log = {
+            "round": round,
             "Rewards/Average": avg_reward,
             "Episode/Length": avg_episode_length,
             "Losses/Actor": train_metrics["actor_loss"],
@@ -498,11 +537,11 @@ if __name__ == "__main__":
             "Metrics/Clip_Fraction": train_metrics["clip_fraction"],
             "Metrics/Advantage_Mean": train_metrics["advantage_mean"],
             "Metrics/Advantage_Std": train_metrics["advantage_std"],
+            "Metrics/Approx_KL": train_metrics["approx_kl"],
+            "Metrics/Explained_Variance": train_metrics["explained_variance"],
         }
-
-        # Save run history
-        with open("run.json", "w") as f:
-            json.dump(run_history, f, indent=2)
+        with open("run.jsonl", "a") as f:
+            f.write(json.dumps(current_log) + "\n")
 
         if round % 50 == 0:
             checkpoint_path = checkpoints_out / f"{str(round).zfill(7)}.pt"
