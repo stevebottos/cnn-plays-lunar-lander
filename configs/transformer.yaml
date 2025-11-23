@@ -2,26 +2,16 @@
 USE_MIXED_PRECISION: True
 USE_TORCH_COMPILE: False
 
-# Environment Configuration
-env_name: "LunarLander-v3"
-IMAGE_SIZE: 128
-NUM_FRAMES: 16
-MAX_EPISODE_STEPS: 500
-REWARD_CLIP: 1000.0 # basically no reward clipping
-
 # Model Configuration
 model_name: "Conv3DTransformerNet"
 
 # PPO Hyperparameters
-LEARNING_RATE: 0.0003
+LEARNING_RATE: 0.001
 GAMMA: 0.99
 GAE_LAMBDA: 0.95
 VALUE_COEFF: 0.5
-ENTROPY_COEFF: 0.003
+ENTROPY_COEFF: 0.01
 CLIP_EPSILON: 0.2
-PPO_EPOCHS: 2
-COLLECT_EPISODES: 32
-BATCH_SIZE: 64
-NORMALIZE_ADVANTAGES: True  # Always recommend true
-NORMALIZE_RETURNS: True     # Can experiment with false
+PPO_EPOCHS: 4
+BATCH_SIZE: 512
 NUM_ROUNDS: 10000

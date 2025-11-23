@@ -184,7 +184,7 @@ class PPOManager:
                 image_tensor = (
                     torch.from_numpy(observation)
                     .permute(3, 0, 1, 2)
-                    .float()
+                    .to(torch.float16)
                     .unsqueeze(0)
                 )
                 input_tensor = image_tensor.to(self.device) / 255.0
@@ -217,7 +217,7 @@ class PPOManager:
                     image_tensor = (
                         torch.from_numpy(observation)
                         .permute(3, 0, 1, 2)
-                        .float()
+                        .to(torch.float16)
                         .unsqueeze(0)
                     )
                     input_tensor = image_tensor.to(self.device) / 255.0
@@ -402,8 +402,8 @@ class PPOManager:
                 total_ratio_mean += ratio.mean().item()
                 total_value_mean += values.mean().item()
                 total_clip_fraction += clip_fraction.item()
-                total_advantage_mean += advantages_mb.mean().item()
-                total_advantage_std += advantages_mb.std().item()
+                total_advantage_mean += advantages_raw[batch_indices].mean().item()
+                total_advantage_std += advantages_raw[batch_indices].std().item()
                 num_updates += 1
 
                 del states_mb, actions_mb, old_log_probs_mb, advantages_mb, returns_mb

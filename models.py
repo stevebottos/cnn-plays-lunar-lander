@@ -56,7 +56,7 @@ class Conv3DTransformerNet(nn.Module):
         self.num_actions = num_actions
         self.num_frames = num_frames
 
-        self.embed_dim = 256
+        self.embed_dim = 128
         self.seq_len = 256
 
         self.conv3d_stem = nn.Sequential(
@@ -67,7 +67,7 @@ class Conv3DTransformerNet(nn.Module):
         )
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.embed_dim,
-            nhead=8,
+            nhead=4,
             dim_feedforward=256,
             dropout=0.0,
             activation="gelu",
@@ -210,7 +210,7 @@ class TinyCNNv2(nn.Module):
                 padding=(1, 1, 1),
                 bias=False,
             ),
-            nn.GroupNorm(8, 32),  # Only change: BatchNorm3d → GroupNorm
+            nn.BatchNorm3d(32),
         )
         self.block2 = nn.Sequential(
             nn.Conv3d(
@@ -221,7 +221,7 @@ class TinyCNNv2(nn.Module):
                 padding=(1, 1, 1),
                 bias=False,
             ),
-            nn.GroupNorm(8, 64),
+            nn.BatchNorm3d(64),
         )
         self.block3 = nn.Sequential(
             nn.Conv3d(
@@ -232,7 +232,7 @@ class TinyCNNv2(nn.Module):
                 padding=(1, 1, 1),
                 bias=False,
             ),
-            nn.GroupNorm(16, 128),
+            nn.BatchNorm3d(128),
         )
         self.block4 = nn.Sequential(
             nn.Conv3d(
@@ -243,24 +243,24 @@ class TinyCNNv2(nn.Module):
                 padding=(1, 1, 1),
                 bias=False,
             ),
-            nn.GroupNorm(32, 256),
+            nn.BatchNorm3d(256),
         )
 
         self.skip1 = nn.Sequential(
             nn.Conv3d(1, 32, kernel_size=1, stride=(2, 2, 2), bias=False),
-            nn.GroupNorm(8, 32),
+            nn.BatchNorm3d(32),
         )
         self.skip2 = nn.Sequential(
             nn.Conv3d(32, 64, kernel_size=1, stride=(2, 2, 2), bias=False),
-            nn.GroupNorm(8, 64),
+            nn.BatchNorm3d(64),
         )
         self.skip3 = nn.Sequential(
             nn.Conv3d(64, 128, kernel_size=1, stride=(2, 2, 2), bias=False),
-            nn.GroupNorm(16, 128),
+            nn.BatchNorm3d(128),
         )
         self.skip4 = nn.Sequential(
             nn.Conv3d(128, 256, kernel_size=1, stride=(2, 2, 2), bias=False),
-            nn.GroupNorm(32, 256),
+            nn.BatchNorm3d(256),
         )
 
         self.act = nn.SiLU()
@@ -276,7 +276,7 @@ class TinyCNNv2(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, (nn.GroupNorm, nn.BatchNorm3d)):
+            elif isinstance(m, nn.BatchNorm3d):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
