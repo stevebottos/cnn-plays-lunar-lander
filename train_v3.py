@@ -180,17 +180,22 @@ class PPOManager:
                     map_location=self.inference_device,
                 )
                 if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-                    state_dict = checkpoint["model_state_dict"]
+                    agent.load_state_dict(checkpoint["model_state_dict"], strict=True)
+                    self.checkpoint_optimizer_state = checkpoint.get(
+                        "optimizer_state_dict", None
+                    )
                 else:
-                    state_dict = checkpoint
-                agent.load_state_dict(state_dict, strict=False)
+                    agent.load_state_dict(checkpoint, strict=True)
+                    self.checkpoint_optimizer_state = None
                 print(
-                    "✓ Loaded ResNet backbone weights from checkpoints/TEMPRES_STARTER.pt"
+                    "✓ Loaded TemporalResNetGRU checkpoint from checkpoints/GRU_STARTER.pt"
                 )
             except FileNotFoundError:
                 print("No checkpoint found, using fresh ImageNet weights")
+                self.checkpoint_optimizer_state = None
             except Exception as e:
                 print(f"Error loading checkpoint: {e}, using fresh ImageNet weights")
+                self.checkpoint_optimizer_state = None
         elif config.model_name == "TemporalMobileNetGRU":
             agent = TemporalMobileNetGRU(num_actions=4)
             print("✓ Using pretrained MobileNetV3-Large from ImageNet")
