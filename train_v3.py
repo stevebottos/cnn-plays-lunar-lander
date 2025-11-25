@@ -13,9 +13,19 @@ import yaml
 import os
 import gc
 from datetime import datetime
-from models import Conv3DTransformerNet, Conv3dResNet, TinyCNN, TinyCNNv2, TinyCNNv3
+from models import (
+    Conv3DTransformerNet,
+    Conv3dResNet,
+    TemporalResNet,
+    TemporalResNetGRU,
+    TemporalMobileNetGRU,
+    TinyCNN,
+    TinyCNNv2,
+    TinyCNNv2LSTM,
+    TinyCNNv2Gated,
+    TinyCNNv3,
+)
 from configs.config import TrainingConfig
-from collections import namedtuple, deque
 import tracemalloc
 from gymnasium.wrappers import (
     AddRenderObservation,
@@ -23,7 +33,6 @@ from gymnasium.wrappers import (
     GrayscaleObservation,
     FrameStackObservation,
 )
-from dataclasses import dataclass
 
 
 def load_config(config_path: str) -> TrainingConfig:
@@ -38,7 +47,7 @@ def memops():
     torch.backends.cuda.enable_flash_sdp(True)
 
 
-NUM_STEPS_PER_ROLLOUT = 1024 * 4
+NUM_STEPS_PER_ROLLOUT = 1024 * 8
 FRAME_SIZE = 128
 NUM_FRAMES_PER_BATCH = 16
 
@@ -53,13 +62,27 @@ class PPOManager:
         self.inference_device = torch.device(INFERENCE_DEVICE)
         self.agent = self._get_model().to(self.inference_device)
 
-        # try:
-        #     state_dict = torch.load("checkpoints/STARTER.pt")
-        #     self.agent.load_state_dict(state_dict)
-        # except:
-        #     print("Unable to load from checkpoint.")
-
         self.optimizer = optim.Adam(self.agent.parameters(), lr=config.LEARNING_RATE)
+
+        self.loaded_from_checkpoint = (
+            hasattr(self, "checkpoint_optimizer_state")
+            and self.checkpoint_optimizer_state is not None
+        )
+        if self.loaded_from_checkpoint:
+            try:
+                self.optimizer.load_state_dict(self.checkpoint_optimizer_state)
+                print("✓ Restored optimizer state from checkpoint")
+            except Exception as e:
+                print(f"⚠ Could not restore optimizer state: {e}")
+                self.loaded_from_checkpoint = False
+
+        def lr_lambda(round_num):
+            if self.loaded_from_checkpoint and round_num < 5:
+                return 0.1 + 0.18 * round_num
+            return 1.0
+
+        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+
         self.env = self._get_env()
 
         if config.USE_MIXED_PRECISION and self.inference_device.type == "cuda":
@@ -109,17 +132,70 @@ class PPOManager:
         )
 
     def _get_model(self):
+        memops()
+
+        self.checkpoint_optimizer_state = None
+
         if config.model_name == "TinyCNN":
             agent = TinyCNN(num_actions=4)
         elif config.model_name == "TinyCNNv2":
             agent = TinyCNNv2(num_actions=4)
+        elif config.model_name == "TinyCNNv2LSTM":
+            agent = TinyCNNv2LSTM(num_actions=4)
+        elif config.model_name == "TinyCNNv2Gated":
+            agent = TinyCNNv2Gated(num_actions=4)
         elif config.model_name == "TinyCNNv3":
             agent = TinyCNNv3(num_actions=4)
         elif config.model_name == "Conv3dResNet":
             agent = Conv3dResNet(num_actions=4)
+        elif config.model_name == "TemporalResNet":
+            agent = TemporalResNet(num_actions=4)
+            try:
+                checkpoint = torch.load(
+                    "checkpoints/TEMPRES_STARTER.pt",
+                    map_location=self.inference_device,
+                )
+                if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                    agent.load_state_dict(checkpoint["model_state_dict"])
+                    self.checkpoint_optimizer_state = checkpoint.get(
+                        "optimizer_state_dict", None
+                    )
+                else:
+                    agent.load_state_dict(checkpoint)
+                    self.checkpoint_optimizer_state = None
+                print(
+                    "✓ Loaded TemporalResNet checkpoint from checkpoints/TEMPRES_STARTER.pt"
+                )
+            except FileNotFoundError:
+                print("No TemporalResNet checkpoint found, starting fresh")
+                self.checkpoint_optimizer_state = None
+            except Exception as e:
+                print(f"Error loading TemporalResNet checkpoint: {e}, starting fresh")
+                self.checkpoint_optimizer_state = None
+        elif config.model_name == "TemporalResNetGRU":
+            agent = TemporalResNetGRU(num_actions=4)
+            try:
+                checkpoint = torch.load(
+                    "checkpoints/GRU_STARTER.pt",
+                    map_location=self.inference_device,
+                )
+                if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                    state_dict = checkpoint["model_state_dict"]
+                else:
+                    state_dict = checkpoint
+                agent.load_state_dict(state_dict, strict=False)
+                print(
+                    "✓ Loaded ResNet backbone weights from checkpoints/TEMPRES_STARTER.pt"
+                )
+            except FileNotFoundError:
+                print("No checkpoint found, using fresh ImageNet weights")
+            except Exception as e:
+                print(f"Error loading checkpoint: {e}, using fresh ImageNet weights")
+        elif config.model_name == "TemporalMobileNetGRU":
+            agent = TemporalMobileNetGRU(num_actions=4)
+            print("✓ Using pretrained MobileNetV3-Large from ImageNet")
         elif config.model_name == "Conv3DTransformerNet":
             agent = Conv3DTransformerNet(num_actions=4)
-            memops()
             try:
                 state_dict = torch.load(
                     "checkpoints/TRANSFORMER_STARTER.pt",
@@ -503,6 +579,11 @@ if __name__ == "__main__":
 
         # Print progress
         if round_num % 10 == 0:
+            lr_info = (
+                f", LR={manager.scheduler.get_last_lr()[0]:.6f}"
+                if manager.loaded_from_checkpoint and round_num < 10
+                else ""
+            )
             print(
                 f"Round {round_num}: "
                 f"Reward={avg_reward:.2f}, "
@@ -512,6 +593,7 @@ if __name__ == "__main__":
                 f"Clip%={train_metrics['clip_fraction'] * 100:.1f}, "
                 f"Adv(μ={train_metrics['advantage_mean']:.3f}, σ={train_metrics['advantage_std']:.3f}), "
                 f"KL={train_metrics['approx_kl']:.3f}, ExpVar={train_metrics['explained_variance']:.3f})"
+                f"{lr_info}"
             )
 
         # Create log entry for the current round and append to jsonl file
@@ -535,7 +617,16 @@ if __name__ == "__main__":
 
         if round_num % 50 == 0:
             checkpoint_path = checkpoints_out / f"{str(round_num).zfill(7)}.pt"
-            torch.save(manager.agent.state_dict(), str(checkpoint_path))
+            torch.save(
+                {
+                    "model_state_dict": manager.agent.state_dict(),
+                    "optimizer_state_dict": manager.optimizer.state_dict(),
+                    "round": round_num,
+                },
+                str(checkpoint_path),
+            )
+
+        manager.scheduler.step()
 
     manager.close()
     mlflow.end_run()
