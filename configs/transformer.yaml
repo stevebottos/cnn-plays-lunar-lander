@@ -4,6 +4,8 @@ USE_TORCH_COMPILE: False
 
 # Model Configuration
 model_name: "Conv3DTransformerNet"
+MAX_EPISODE_STEPS: 250
+NUM_STEPS_PER_ROLLOUT: 1024
 
 # PPO Hyperparameters
 LEARNING_RATE: 0.001

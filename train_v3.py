@@ -47,7 +47,9 @@ def memops():
     torch.backends.cuda.enable_flash_sdp(True)
 
 
-NUM_STEPS_PER_ROLLOUT = 1024 * 8
+# Parallel environment configuration
+NUM_ENVS = 8  # Number of parallel environments
+
 FRAME_SIZE = 128
 NUM_FRAMES_PER_BATCH = 16
 
@@ -55,14 +57,54 @@ STORAGE_DEVICE = "cpu"
 INFERENCE_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def make_env(max_episode_steps=250):
+    """Factory function to create a single wrapped environment"""
+    env = gym.make(
+        "LunarLander-v3",
+        render_mode="rgb_array",
+        max_episode_steps=max_episode_steps,
+    )
+    env = AddRenderObservation(env)
+    env = ResizeObservation(env, (FRAME_SIZE, FRAME_SIZE))
+    env = GrayscaleObservation(env, keep_dim=True)
+    env = FrameStackObservation(env, NUM_FRAMES_PER_BATCH)
+    return env
+
+
 class PPOManager:
     def __init__(self, config):
         self.config = config
+        self.num_steps_per_rollout = config.NUM_STEPS_PER_ROLLOUT
         self.storage_device = torch.device(STORAGE_DEVICE)
         self.inference_device = torch.device(INFERENCE_DEVICE)
         self.agent = self._get_model().to(self.inference_device)
 
-        self.optimizer = optim.Adam(self.agent.parameters(), lr=config.LEARNING_RATE)
+        # Setup optimizer with optional separate learning rate for GRU
+        if (
+            config.model_name == "TemporalResNetGRU"
+            and config.GRU_LEARNING_RATE is not None
+        ):
+            # Use different learning rates for pretrained backbone vs trained-from-scratch GRU
+            backbone_params = list(self.agent.backbone.parameters())
+            gru_and_heads_params = (
+                list(self.agent.gru.parameters())
+                + list(self.agent.norm.parameters())
+                + list(self.agent.actor.parameters())
+                + list(self.agent.critic.parameters())
+            )
+            self.optimizer = optim.Adam(
+                [
+                    {"params": backbone_params, "lr": config.LEARNING_RATE},
+                    {"params": gru_and_heads_params, "lr": config.GRU_LEARNING_RATE},
+                ]
+            )
+            print(
+                f"Using separate learning rates: Backbone LR={config.LEARNING_RATE}, GRU+Heads LR={config.GRU_LEARNING_RATE}"
+            )
+        else:
+            self.optimizer = optim.Adam(
+                self.agent.parameters(), lr=config.LEARNING_RATE
+            )
 
         self.loaded_from_checkpoint = (
             hasattr(self, "checkpoint_optimizer_state")
@@ -76,12 +118,8 @@ class PPOManager:
                 print(f"⚠ Could not restore optimizer state: {e}")
                 self.loaded_from_checkpoint = False
 
-        def lr_lambda(round_num):
-            if self.loaded_from_checkpoint and round_num < 5:
-                return 0.1 + 0.18 * round_num
-            return 1.0
-
-        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+        # No warmup - constant learning rate throughout
+        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lambda round_num: 1.0)
 
         self.env = self._get_env()
 
@@ -99,36 +137,67 @@ class PPOManager:
         self.scaler = scaler
         self.episode_count = 0
 
-        # Pre-allocated rollout storage
+        # Pre-allocated rollout storage with pinned memory for faster CPU→GPU transfers
+        pin = self.storage_device.type == "cpu"
         self.obs = torch.zeros(
-            NUM_STEPS_PER_ROLLOUT,
+            self.num_steps_per_rollout,
+            NUM_ENVS,
             1,
             NUM_FRAMES_PER_BATCH,
             FRAME_SIZE,
             FRAME_SIZE,
             dtype=torch.uint8,
             device=self.storage_device,
+            pin_memory=pin,
         )
         self.actions = torch.zeros(
-            NUM_STEPS_PER_ROLLOUT, dtype=torch.int64, device=self.storage_device
+            self.num_steps_per_rollout,
+            NUM_ENVS,
+            dtype=torch.int64,
+            device=self.storage_device,
+            pin_memory=pin,
         )
         self.log_probs = torch.zeros(
-            NUM_STEPS_PER_ROLLOUT, dtype=torch.float32, device=self.storage_device
+            self.num_steps_per_rollout,
+            NUM_ENVS,
+            dtype=torch.float32,
+            device=self.storage_device,
+            pin_memory=pin,
         )
         self.rewards = torch.zeros(
-            NUM_STEPS_PER_ROLLOUT, dtype=torch.float32, device=self.storage_device
+            self.num_steps_per_rollout,
+            NUM_ENVS,
+            dtype=torch.float32,
+            device=self.storage_device,
+            pin_memory=pin,
         )
         self.dones = torch.zeros(
-            NUM_STEPS_PER_ROLLOUT, dtype=torch.float32, device=self.storage_device
+            self.num_steps_per_rollout,
+            NUM_ENVS,
+            dtype=torch.float32,
+            device=self.storage_device,
+            pin_memory=pin,
         )
         self.values = torch.zeros(
-            NUM_STEPS_PER_ROLLOUT, dtype=torch.float32, device=self.storage_device
+            self.num_steps_per_rollout,
+            NUM_ENVS,
+            dtype=torch.float32,
+            device=self.storage_device,
+            pin_memory=pin,
         )
         self.advantages = torch.zeros(
-            NUM_STEPS_PER_ROLLOUT, dtype=torch.float32, device=self.storage_device
+            self.num_steps_per_rollout,
+            NUM_ENVS,
+            dtype=torch.float32,
+            device=self.storage_device,
+            pin_memory=pin,
         )
         self.returns = torch.zeros(
-            NUM_STEPS_PER_ROLLOUT, dtype=torch.float32, device=self.storage_device
+            self.num_steps_per_rollout,
+            NUM_ENVS,
+            dtype=torch.float32,
+            device=self.storage_device,
+            pin_memory=pin,
         )
 
     def _get_model(self):
@@ -174,28 +243,50 @@ class PPOManager:
                 self.checkpoint_optimizer_state = None
         elif config.model_name == "TemporalResNetGRU":
             agent = TemporalResNetGRU(num_actions=4)
-            try:
-                checkpoint = torch.load(
-                    "checkpoints/GRU_STARTER.pt",
-                    map_location=self.inference_device,
-                )
-                if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-                    agent.load_state_dict(checkpoint["model_state_dict"], strict=True)
-                    self.checkpoint_optimizer_state = checkpoint.get(
-                        "optimizer_state_dict", None
+
+            # Compile BEFORE loading checkpoint to match saved state_dict structure
+            if config.USE_TORCH_COMPILE:
+                try:
+                    agent = torch.compile(agent, mode="reduce-overhead")
+                    print("✓ Model compiled with torch.compile")
+                except Exception as e:
+                    print(f"⚠ torch.compile failed: {e}")
+
+            # Load checkpoint if specified in config
+            if config.CHECKPOINT_PATH:
+                try:
+                    checkpoint = torch.load(
+                        config.CHECKPOINT_PATH,
+                        map_location=self.inference_device,
                     )
-                else:
-                    agent.load_state_dict(checkpoint, strict=True)
+                    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                        result = agent.load_state_dict(
+                            checkpoint["model_state_dict"], strict=True
+                        )
+                        self.checkpoint_optimizer_state = checkpoint.get(
+                            "optimizer_state_dict", None
+                        )
+                        print(f"✓ Loaded TemporalResNetGRU checkpoint from {config.CHECKPOINT_PATH}")
+                        print(f"  Missing keys: {result.missing_keys}")
+                        print(f"  Unexpected keys: {result.unexpected_keys}")
+                    else:
+                        result = agent.load_state_dict(checkpoint, strict=True)
+                        self.checkpoint_optimizer_state = None
+                        print(f"✓ Loaded TemporalResNetGRU checkpoint from {config.CHECKPOINT_PATH}")
+                        print(f"  Missing keys: {result.missing_keys}")
+                        print(f"  Unexpected keys: {result.unexpected_keys}")
+                except FileNotFoundError:
+                    print(f"⚠ Checkpoint not found at {config.CHECKPOINT_PATH}, using fresh ImageNet weights")
                     self.checkpoint_optimizer_state = None
-                print(
-                    "✓ Loaded TemporalResNetGRU checkpoint from checkpoints/GRU_STARTER.pt"
-                )
-            except FileNotFoundError:
-                print("No checkpoint found, using fresh ImageNet weights")
+                except Exception as e:
+                    print(f"⚠ Error loading checkpoint from {config.CHECKPOINT_PATH}: {e}")
+                    print("  Using fresh ImageNet weights")
+                    self.checkpoint_optimizer_state = None
+            else:
+                print("No checkpoint specified, using fresh ImageNet weights")
                 self.checkpoint_optimizer_state = None
-            except Exception as e:
-                print(f"Error loading checkpoint: {e}, using fresh ImageNet weights")
-                self.checkpoint_optimizer_state = None
+
+            return agent
         elif config.model_name == "TemporalMobileNetGRU":
             agent = TemporalMobileNetGRU(num_actions=4)
             print("✓ Using pretrained MobileNetV3-Large from ImageNet")
@@ -225,16 +316,10 @@ class PPOManager:
         return agent
 
     def _get_env(self):
-        env = gym.make(
-            "LunarLander-v3",
-            render_mode="rgb_array",
-            max_episode_steps=250,
-        )
-        env = AddRenderObservation(env)
-        env = ResizeObservation(env, (FRAME_SIZE, FRAME_SIZE))
-        env = GrayscaleObservation(env, keep_dim=True)
-        env = FrameStackObservation(env, NUM_FRAMES_PER_BATCH)
-        return env
+        # Create asynchronous vectorized environment (runs in parallel subprocesses)
+        max_steps = self.config.MAX_EPISODE_STEPS
+        envs = gym.vector.AsyncVectorEnv([lambda: make_env(max_steps) for _ in range(NUM_ENVS)])
+        return envs
 
     def close(self):
         self.env.close()
@@ -243,7 +328,6 @@ class PPOManager:
     def get_rollout(self):
         self.agent.eval()
 
-        # Zero-out the storage tensors
         self.obs.zero_()
         self.actions.zero_()
         self.log_probs.zero_()
@@ -251,102 +335,100 @@ class PPOManager:
         self.dones.zero_()
         self.values.zero_()
 
-        # Initialize environment and observation
-        current_observation, info = self.env.reset()
+        current_observations, infos = self.env.reset()
 
-        # Keep track of episode rewards for logging
         episode_rewards_list = []
-        current_episode_rewards = 0
+        episode_lengths_list = []
+        current_episode_rewards = np.zeros(NUM_ENVS)
+        current_episode_lengths = np.zeros(NUM_ENVS, dtype=np.int32)
 
-        step_idx = 0
-        while step_idx < NUM_STEPS_PER_ROLLOUT:
-            # Process current_observation and store directly into self.obs
-            # The observation from the environment is a lazy frame stack (16, 128, 128, 1)
-            # Permute to (1, 16, 128, 128) and store as float16 on CPU
-            self.obs[step_idx] = (
-                torch.from_numpy(current_observation)
-                .permute(3, 0, 1, 2)
+        for step_idx in range(self.num_steps_per_rollout):
+            obs_batch = (
+                torch.from_numpy(current_observations)
+                .permute(0, 4, 1, 2, 3)
                 .to(torch.uint8)
-                .unsqueeze(1)
             )
+            self.obs[step_idx] = obs_batch
 
             with torch.amp.autocast(
                 "cuda", enabled=self.config.USE_MIXED_PRECISION, dtype=self.dtype
             ):
-                agent_input = (
-                    self.obs[step_idx].unsqueeze(0).to(self.inference_device) / 255.0
-                )
-                action_logits, value = self.agent(agent_input)
+                agent_input = self.obs[step_idx].to(self.inference_device) / 255.0
+                action_logits, values = self.agent(agent_input)
+
             action_dist = Categorical(logits=action_logits.float())
-            action = action_dist.sample()
-            log_prob = action_dist.log_prob(action)
+            actions = action_dist.sample()
+            log_probs = action_dist.log_prob(actions)
 
-            # Store action, log_prob, and value
-            self.actions[step_idx] = action.to(self.storage_device)
-            self.log_probs[step_idx] = log_prob.to(self.storage_device)
-            self.values[step_idx] = value.squeeze().to(self.storage_device)
+            self.actions[step_idx] = actions.to(self.storage_device)
+            self.log_probs[step_idx] = log_probs.to(self.storage_device)
+            self.values[step_idx] = values.squeeze(-1).to(self.storage_device)
 
-            # Execute action in the environment
-            next_observation, reward, terminated, truncated, info = self.env.step(
-                action.item()
+            next_observations, rewards, terminateds, truncateds, infos = self.env.step(
+                actions.cpu().numpy()
             )
-            done = terminated or truncated
+            dones = np.logical_or(terminateds, truncateds)
 
-            current_episode_rewards += reward
+            current_episode_rewards += rewards
+            current_episode_lengths += 1
 
-            # Store reward and done flag
-            self.rewards[step_idx] = reward
-            self.dones[step_idx] = float(done)  # 1.0 for done, 0.0 for not done
+            self.rewards[step_idx] = torch.from_numpy(rewards).to(self.storage_device)
+            self.dones[step_idx] = torch.from_numpy(dones.astype(np.float32)).to(
+                self.storage_device
+            )
 
-            # Update current_observation for the next step
-            current_observation = next_observation
+            current_observations = next_observations
 
-            if done:
-                print(f"Episode finished. Total reward: {current_episode_rewards:.2f}")
-                episode_rewards_list.append(current_episode_rewards)
-                current_episode_rewards = 0  # Reset for next episode
-                current_observation, info = self.env.reset()  # Reset environment
+            for env_idx in range(NUM_ENVS):
+                if dones[env_idx]:
+                    print(
+                        f"Env {env_idx} - Episode finished. Total reward: {current_episode_rewards[env_idx]:.2f}, Length: {current_episode_lengths[env_idx]}"
+                    )
+                    episode_rewards_list.append(current_episode_rewards[env_idx])
+                    episode_lengths_list.append(current_episode_lengths[env_idx])
+                    current_episode_rewards[env_idx] = 0
+                    current_episode_lengths[env_idx] = 0
 
-            step_idx += 1  # Increment step counter
+        with torch.no_grad():
+            agent_input_for_next_value = (
+                torch.from_numpy(current_observations)
+                .permute(0, 4, 1, 2, 3)
+                .to(torch.uint8)
+                .to(self.inference_device)
+                / 255.0
+            )
+            _, next_values = self.agent(agent_input_for_next_value)
+            next_values = next_values.squeeze(-1).to(self.storage_device)
 
-        # --- GAE and Advantage Normalization ---
-        last_done_flag = self.dones[NUM_STEPS_PER_ROLLOUT - 1].item()
+        last_dones = self.dones[self.num_steps_per_rollout - 1]
+        next_values = next_values * (1.0 - last_dones)
 
-        next_value_tensor = torch.tensor(0.0, device=self.inference_device)
-        if last_done_flag == 0.0:  # If the last step was NOT terminal
-            with torch.no_grad():
-                agent_input_for_next_value = (
-                    torch.from_numpy(current_observation)
-                    .permute(3, 0, 1, 2)
-                    .to(torch.uint8)
-                    .unsqueeze(0)
-                    .to(self.inference_device)
-                    / 255.0
-                )
-                _, next_value_tensor = self.agent(agent_input_for_next_value)
-                next_value_tensor = next_value_tensor.squeeze()
-
-        self._calculate_gae(next_value_tensor, last_done_flag)
+        self._calculate_gae(next_values)
         self._normalize_advantages()
 
-        return episode_rewards_list
+        # Debug: Check value statistics
+        print(f"\nRollout stats:")
+        print(
+            f"  Values - min: {self.values.min():.2f}, max: {self.values.max():.2f}, mean: {self.values.mean():.2f}"
+        )
+        print(
+            f"  Returns - min: {self.returns.min():.2f}, max: {self.returns.max():.2f}, mean: {self.returns.mean():.2f}"
+        )
+        print(
+            f"  Rewards - min: {self.rewards.min():.2f}, max: {self.rewards.max():.2f}, mean: {self.rewards.mean():.2f}"
+        )
 
-    def _calculate_gae(self, next_value: torch.Tensor, last_done: float):
+        return episode_rewards_list, episode_lengths_list
+
+    def _calculate_gae(self, next_values: torch.Tensor):
         """
         Calculates the Generalized Advantage Estimation (GAE) and returns for the rollout.
         This method operates on the pre-filled `self.rewards`, `self.values`, and `self.dones` tensors.
         """
-        last_gae_lam = 0
+        last_gae_lam = torch.zeros(NUM_ENVS, device=self.storage_device)
+        values_with_next = torch.cat((self.values, next_values.unsqueeze(0)), dim=0)
 
-        # We need to consider the value of the state after the last step of the rollout.
-        # If the last step was a terminal state (done=1), the next value is 0.
-        # Otherwise, it's the value estimated by the critic for that `next_observation`.
-        next_value = next_value.reshape(1).to(self.storage_device)
-        next_value_masked = next_value * (1.0 - last_done)
-
-        values_with_next = torch.cat((self.values, next_value_masked), dim=0)
-
-        for t in reversed(range(NUM_STEPS_PER_ROLLOUT)):
+        for t in reversed(range(self.num_steps_per_rollout)):
             mask = 1.0 - self.dones[t]
             delta = (
                 self.rewards[t]
@@ -371,12 +453,17 @@ class PPOManager:
     def ppo_update(self):
         self.agent.train()
 
-        # Data is already aggregated in self.obs, self.actions, etc.
-        # Tensors remain on the storage_device (CPU) until needed for a mini-batch.
+        # Flatten (num_steps_per_rollout, NUM_ENVS, ...) to (num_steps_per_rollout * NUM_ENVS, ...)
+        obs_flat = self.obs.reshape(-1, 1, NUM_FRAMES_PER_BATCH, FRAME_SIZE, FRAME_SIZE)
+        actions_flat = self.actions.reshape(-1)
+        log_probs_flat = self.log_probs.reshape(-1)
+        advantages_flat = self.advantages.reshape(-1)
+        returns_flat = self.returns.reshape(-1)
+        values_flat = self.values.reshape(-1)
 
-        # Calculate explained variance before training (using values from before GAE)
-        explained_var = 1 - torch.var(self.returns - self.values) / (
-            torch.var(self.returns) + 1e-8
+        # Calculate explained variance before training
+        explained_var = 1 - torch.var(returns_flat - values_flat) / (
+            torch.var(returns_flat) + 1e-8
         )
 
         total_actor_loss = 0
@@ -390,7 +477,7 @@ class PPOManager:
         total_approx_kl = 0
         num_updates = 0
 
-        dataset_size = NUM_STEPS_PER_ROLLOUT
+        dataset_size = self.num_steps_per_rollout * NUM_ENVS
         indices = np.arange(dataset_size)
 
         # PPO Epochs loop
@@ -398,21 +485,37 @@ class PPOManager:
             np.random.shuffle(indices)
 
             # Mini-batch loop
-            for start in range(0, dataset_size, self.config.BATCH_SIZE):
+            num_batches = (
+                dataset_size + self.config.BATCH_SIZE - 1
+            ) // self.config.BATCH_SIZE
+            for batch_idx, start in enumerate(
+                range(0, dataset_size, self.config.BATCH_SIZE)
+            ):
                 end = start + self.config.BATCH_SIZE
                 batch_indices = indices[start:end]
 
-                # Get mini-batch data and move to the inference device
+                # Simple progress bar
+                progress = (batch_idx + 1) / num_batches
+                bar_length = 60
+                filled = int(bar_length * progress)
+                bar = "=" * filled + "-" * (bar_length - filled)
+                print(
+                    f"\rEpoch {epoch + 1}/{self.config.PPO_EPOCHS} [{bar}] {batch_idx + 1}/{num_batches}",
+                    end="",
+                    flush=True,
+                )
+
+                # Get mini-batch data from flattened tensors
                 states_mb = (
-                    self.obs[batch_indices].to(self.inference_device, self.dtype)
+                    obs_flat[batch_indices].to(self.inference_device, self.dtype)
                     / 255.0
                 )
-                actions_mb = self.actions[batch_indices].to(self.inference_device)
-                old_log_probs_mb = self.log_probs[batch_indices].to(
+                actions_mb = actions_flat[batch_indices].to(self.inference_device)
+                old_log_probs_mb = log_probs_flat[batch_indices].to(
                     self.inference_device
                 )
-                advantages_mb = self.advantages[batch_indices].to(self.inference_device)
-                returns_mb = self.returns[batch_indices].to(self.inference_device)
+                advantages_mb = advantages_flat[batch_indices].to(self.inference_device)
+                returns_mb = returns_flat[batch_indices].to(self.inference_device)
 
                 with torch.amp.autocast(
                     "cuda", enabled=self.config.USE_MIXED_PRECISION, dtype=self.dtype
@@ -481,7 +584,8 @@ class PPOManager:
                 del action_logits, values, action_dist, log_probs, entropy
                 del ratio, surr1, surr2, actor_loss, critic_loss, total_loss
 
-        # This block should be outside the epoch loop
+        print()  # New line after progress bar
+
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -530,19 +634,14 @@ if __name__ == "__main__":
     manager = PPOManager(config)
 
     for round_num in range(config.NUM_ROUNDS):
-        episode_rewards = (
-            manager.get_rollout()
-        )  # get_rollout now prepares all data and returns episode rewards
+        episode_rewards, episode_lengths = manager.get_rollout()
 
         # Update policy
         train_metrics = manager.ppo_update()
 
         # Calculate metrics for the collected rollout
         avg_reward = np.mean(episode_rewards) if episode_rewards else 0.0
-        # avg_episode_length can be improved
-        avg_episode_length = (
-            manager.dones.sum().item() if manager.dones.sum().item() > 0 else 1
-        )
+        avg_episode_length = np.mean(episode_lengths) if episode_lengths else 0.0
 
         # Log metrics to MLflow
         mlflow.log_metric("Rewards/Average", avg_reward, step=round_num + 1)
@@ -584,11 +683,6 @@ if __name__ == "__main__":
 
         # Print progress
         if round_num % 10 == 0:
-            lr_info = (
-                f", LR={manager.scheduler.get_last_lr()[0]:.6f}"
-                if manager.loaded_from_checkpoint and round_num < 10
-                else ""
-            )
             print(
                 f"Round {round_num}: "
                 f"Reward={avg_reward:.2f}, "
@@ -598,7 +692,6 @@ if __name__ == "__main__":
                 f"Clip%={train_metrics['clip_fraction'] * 100:.1f}, "
                 f"Adv(μ={train_metrics['advantage_mean']:.3f}, σ={train_metrics['advantage_std']:.3f}), "
                 f"KL={train_metrics['approx_kl']:.3f}, ExpVar={train_metrics['explained_variance']:.3f})"
-                f"{lr_info}"
             )
 
         # Create log entry for the current round and append to jsonl file
