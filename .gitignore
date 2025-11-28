@@ -4,13 +4,20 @@ notes/
 .python-version 
 .uv.lock 
 runs/
-# Python-generated files
 __pycache__/
 *.py[oc]
 build/
 dist/
 wheels/
 *.egg-info
-
-# Virtual environments
+configs 
+!configs/config.py
+!configs/temporal_resnet_gru.yaml
+*.md 
+*.jsonl 
+*.pt
+gather_samples.py 
+mlruns 
+sample_episodes/ 
+uv.lock
 .venv

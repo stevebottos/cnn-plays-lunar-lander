@@ -107,25 +107,17 @@ class TemporalResNet(nn.Module):
         nn.init.zeros_(self.critic.bias)
 
     def forward(self, x):
-        # x: (batch, 1, num_frames, H, W)
         batch_size = x.size(0)
 
-        # Reshape to process each frame independently
-        # (batch, 1, num_frames, H, W) -> (batch * num_frames, 1, H, W)
         x = x.squeeze(1)  # (batch, num_frames, H, W)
         x = x.reshape(batch_size * self.num_frames, 1, x.size(2), x.size(3))
 
-        # Extract features from each frame with ResNet
         features = self.backbone(x)  # (batch * num_frames, 512)
 
-        # Reshape back to sequence
-        # (batch * num_frames, 512) -> (batch, num_frames, 512)
         features = features.reshape(batch_size, self.num_frames, -1)
 
-        # Project to embedding dimension
         features = self.feature_proj(features)  # (batch, num_frames, embed_dim)
 
-        # Add positional embeddings
         features = features + self.pos_embed
 
         # Temporal transformer
@@ -877,15 +869,11 @@ class TinyCNNv3(nn.Module):
         self.bn5 = nn.BatchNorm2d(256)
         self.skip5 = nn.Conv2d(256, 256, kernel_size=1, stride=2)
 
-        # Changed: Replaced AdaptiveAvgPool2d with Flatten
         self.flatten = nn.Flatten()
-        self.feature_extractor_output_size = (
-            256 * 4 * 4
-        )  # 256 channels * 4x4 spatial dimensions
+        self.feature_extractor_output_size = 256 * 4 * 4
 
         self.relu = nn.ReLU(inplace=True)
 
-        # Updated linear layers to match the new flattened output size
         self.actor = nn.Linear(self.feature_extractor_output_size, num_actions)
         self.critic = nn.Linear(self.feature_extractor_output_size, 1)
 

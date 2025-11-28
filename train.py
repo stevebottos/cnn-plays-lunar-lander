@@ -47,8 +47,7 @@ def memops():
     torch.backends.cuda.enable_flash_sdp(True)
 
 
-# Parallel environment configuration
-NUM_ENVS = 8  # Number of parallel environments
+NUM_ENVS = 8
 
 FRAME_SIZE = 128
 NUM_FRAMES_PER_BATCH = 16
@@ -79,12 +78,10 @@ class PPOManager:
         self.inference_device = torch.device(INFERENCE_DEVICE)
         self.agent = self._get_model().to(self.inference_device)
 
-        # Setup optimizer with optional separate learning rate for GRU
         if (
             config.model_name == "TemporalResNetGRU"
             and config.GRU_LEARNING_RATE is not None
         ):
-            # Use different learning rates for pretrained backbone vs trained-from-scratch GRU
             backbone_params = list(self.agent.backbone.parameters())
             gru_and_heads_params = (
                 list(self.agent.gru.parameters())
@@ -113,12 +110,10 @@ class PPOManager:
         if self.loaded_from_checkpoint:
             try:
                 self.optimizer.load_state_dict(self.checkpoint_optimizer_state)
-                print("✓ Restored optimizer state from checkpoint")
             except Exception as e:
-                print(f"⚠ Could not restore optimizer state: {e}")
+                print(f"Could not restore optimizer state: {e}")
                 self.loaded_from_checkpoint = False
 
-        # No warmup - constant learning rate throughout
         self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lambda round_num: 1.0)
 
         self.env = self._get_env()
@@ -137,7 +132,6 @@ class PPOManager:
         self.scaler = scaler
         self.episode_count = 0
 
-        # Pre-allocated rollout storage with pinned memory for faster CPU→GPU transfers
         pin = self.storage_device.type == "cpu"
         self.obs = torch.zeros(
             self.num_steps_per_rollout,
@@ -232,9 +226,6 @@ class PPOManager:
                 else:
                     agent.load_state_dict(checkpoint)
                     self.checkpoint_optimizer_state = None
-                print(
-                    "✓ Loaded TemporalResNet checkpoint from checkpoints/TEMPRES_STARTER.pt"
-                )
             except FileNotFoundError:
                 print("No TemporalResNet checkpoint found, starting fresh")
                 self.checkpoint_optimizer_state = None
@@ -244,15 +235,12 @@ class PPOManager:
         elif config.model_name == "TemporalResNetGRU":
             agent = TemporalResNetGRU(num_actions=4)
 
-            # Compile BEFORE loading checkpoint to match saved state_dict structure
             if config.USE_TORCH_COMPILE:
                 try:
                     agent = torch.compile(agent, mode="reduce-overhead")
-                    print("✓ Model compiled with torch.compile")
                 except Exception as e:
-                    print(f"⚠ torch.compile failed: {e}")
+                    print(f"torch.compile failed: {e}")
 
-            # Load checkpoint if specified in config
             if config.CHECKPOINT_PATH:
                 try:
                     checkpoint = torch.load(
@@ -260,36 +248,27 @@ class PPOManager:
                         map_location=self.inference_device,
                     )
                     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-                        result = agent.load_state_dict(
+                        agent.load_state_dict(
                             checkpoint["model_state_dict"], strict=True
                         )
                         self.checkpoint_optimizer_state = checkpoint.get(
                             "optimizer_state_dict", None
                         )
-                        print(f"✓ Loaded TemporalResNetGRU checkpoint from {config.CHECKPOINT_PATH}")
-                        print(f"  Missing keys: {result.missing_keys}")
-                        print(f"  Unexpected keys: {result.unexpected_keys}")
                     else:
-                        result = agent.load_state_dict(checkpoint, strict=True)
+                        agent.load_state_dict(checkpoint, strict=True)
                         self.checkpoint_optimizer_state = None
-                        print(f"✓ Loaded TemporalResNetGRU checkpoint from {config.CHECKPOINT_PATH}")
-                        print(f"  Missing keys: {result.missing_keys}")
-                        print(f"  Unexpected keys: {result.unexpected_keys}")
                 except FileNotFoundError:
-                    print(f"⚠ Checkpoint not found at {config.CHECKPOINT_PATH}, using fresh ImageNet weights")
+                    print(f"Checkpoint not found: {config.CHECKPOINT_PATH}")
                     self.checkpoint_optimizer_state = None
                 except Exception as e:
-                    print(f"⚠ Error loading checkpoint from {config.CHECKPOINT_PATH}: {e}")
-                    print("  Using fresh ImageNet weights")
+                    print(f"Error loading checkpoint: {e}")
                     self.checkpoint_optimizer_state = None
             else:
-                print("No checkpoint specified, using fresh ImageNet weights")
                 self.checkpoint_optimizer_state = None
 
             return agent
         elif config.model_name == "TemporalMobileNetGRU":
             agent = TemporalMobileNetGRU(num_actions=4)
-            print("✓ Using pretrained MobileNetV3-Large from ImageNet")
         elif config.model_name == "Conv3DTransformerNet":
             agent = Conv3DTransformerNet(num_actions=4)
             try:
@@ -298,13 +277,10 @@ class PPOManager:
                     map_location=self.inference_device,
                 )
                 agent.load_state_dict(state_dict)
-                print(
-                    "✓ Loaded transformer checkpoint from checkpoints/TRANSFORMER_STARTER.pt"
-                )
             except FileNotFoundError:
-                print("No transformer checkpoint found, starting fresh")
+                pass
             except Exception as e:
-                print(f"Error loading transformer checkpoint: {e}, starting fresh")
+                print(f"Error loading transformer checkpoint: {e}")
         else:
             raise ValueError(f"Unknown model_name: {config.model_name}")
 
@@ -316,7 +292,6 @@ class PPOManager:
         return agent
 
     def _get_env(self):
-        # Create asynchronous vectorized environment (runs in parallel subprocesses)
         max_steps = self.config.MAX_EPISODE_STEPS
         envs = gym.vector.AsyncVectorEnv([lambda: make_env(max_steps) for _ in range(NUM_ENVS)])
         return envs
@@ -406,18 +381,6 @@ class PPOManager:
         self._calculate_gae(next_values)
         self._normalize_advantages()
 
-        # Debug: Check value statistics
-        print(f"\nRollout stats:")
-        print(
-            f"  Values - min: {self.values.min():.2f}, max: {self.values.max():.2f}, mean: {self.values.mean():.2f}"
-        )
-        print(
-            f"  Returns - min: {self.returns.min():.2f}, max: {self.returns.max():.2f}, mean: {self.returns.mean():.2f}"
-        )
-        print(
-            f"  Rewards - min: {self.rewards.min():.2f}, max: {self.rewards.max():.2f}, mean: {self.rewards.mean():.2f}"
-        )
-
         return episode_rewards_list, episode_lengths_list
 
     def _calculate_gae(self, next_values: torch.Tensor):
@@ -453,7 +416,6 @@ class PPOManager:
     def ppo_update(self):
         self.agent.train()
 
-        # Flatten (num_steps_per_rollout, NUM_ENVS, ...) to (num_steps_per_rollout * NUM_ENVS, ...)
         obs_flat = self.obs.reshape(-1, 1, NUM_FRAMES_PER_BATCH, FRAME_SIZE, FRAME_SIZE)
         actions_flat = self.actions.reshape(-1)
         log_probs_flat = self.log_probs.reshape(-1)
@@ -461,7 +423,6 @@ class PPOManager:
         returns_flat = self.returns.reshape(-1)
         values_flat = self.values.reshape(-1)
 
-        # Calculate explained variance before training
         explained_var = 1 - torch.var(returns_flat - values_flat) / (
             torch.var(returns_flat) + 1e-8
         )
@@ -480,11 +441,13 @@ class PPOManager:
         dataset_size = self.num_steps_per_rollout * NUM_ENVS
         indices = np.arange(dataset_size)
 
-        # PPO Epochs loop
+        consecutive_high_kl = 0
+        early_stop = False
         for epoch in range(self.config.PPO_EPOCHS):
+            if early_stop:
+                break
             np.random.shuffle(indices)
 
-            # Mini-batch loop
             num_batches = (
                 dataset_size + self.config.BATCH_SIZE - 1
             ) // self.config.BATCH_SIZE
@@ -494,7 +457,6 @@ class PPOManager:
                 end = start + self.config.BATCH_SIZE
                 batch_indices = indices[start:end]
 
-                # Simple progress bar
                 progress = (batch_idx + 1) / num_batches
                 bar_length = 60
                 filled = int(bar_length * progress)
@@ -505,7 +467,6 @@ class PPOManager:
                     flush=True,
                 )
 
-                # Get mini-batch data from flattened tensors
                 states_mb = (
                     obs_flat[batch_indices].to(self.inference_device, self.dtype)
                     / 255.0
@@ -525,13 +486,22 @@ class PPOManager:
                     log_probs = action_dist.log_prob(actions_mb)
                     entropy = action_dist.entropy().mean()
 
-                    # Actor loss with PPO clipping
                     ratio = torch.exp(log_probs - old_log_probs_mb)
 
-                    # Calculate Approximate KL Divergence
                     with torch.no_grad():
                         approx_kl = ((ratio - 1) - torch.log(ratio)).mean().item()
                     total_approx_kl += approx_kl
+
+                    if self.config.TARGET_KL is not None:
+                        if approx_kl > self.config.TARGET_KL:
+                            consecutive_high_kl += 1
+                            if consecutive_high_kl >= 2:
+                                print(f"\nEarly stopping: {consecutive_high_kl} consecutive batches exceeded KL={self.config.TARGET_KL}")
+                                early_stop = True
+                                break
+                        else:
+                            consecutive_high_kl = 0
+
                     surr1 = ratio * advantages_mb
                     surr2 = (
                         torch.clamp(
@@ -543,15 +513,12 @@ class PPOManager:
                     )
                     actor_loss = -torch.min(surr1, surr2).mean()
 
-                    # Track clipping statistics
                     clip_fraction = (
                         ((ratio - 1.0).abs() > self.config.CLIP_EPSILON).float().mean()
                     )
 
-                    # Critic loss
                     critic_loss = F.mse_loss(values.squeeze(-1), returns_mb)
 
-                    # Total loss
                     total_loss = (
                         actor_loss
                         + self.config.VALUE_COEFF * critic_loss
@@ -584,11 +551,26 @@ class PPOManager:
                 del action_logits, values, action_dist, log_probs, entropy
                 del ratio, surr1, surr2, actor_loss, critic_loss, total_loss
 
-        print()  # New line after progress bar
+        print()
 
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        if num_updates == 0:
+            print("No updates completed (early stop on first batch)")
+            return {
+                "actor_loss": 0.0,
+                "critic_loss": 0.0,
+                "entropy": 0.0,
+                "ratio_mean": 1.0,
+                "value_mean": 0.0,
+                "clip_fraction": 0.0,
+                "advantage_mean": 0.0,
+                "advantage_std": 0.0,
+                "approx_kl": 0.0,
+                "explained_variance": 0.0,
+            }
 
         return {
             "actor_loss": total_actor_loss / num_updates,
@@ -618,13 +600,11 @@ if __name__ == "__main__":
     checkpoints_out = Path("checkpoints")
     checkpoints_out.mkdir(parents=True, exist_ok=True)
 
-    # Recreate run.jsonl at the start of each run
     jsonl_file_path = "run.jsonl"
     if os.path.exists(jsonl_file_path):
         os.remove(jsonl_file_path)
         print(f"Recreated {jsonl_file_path} for new run.")
 
-    # Setup MLflow
     mlflow.set_experiment(config_name)
     run_name = f"{config.model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run = mlflow.start_run(run_name=run_name)
@@ -636,14 +616,22 @@ if __name__ == "__main__":
     for round_num in range(config.NUM_ROUNDS):
         episode_rewards, episode_lengths = manager.get_rollout()
 
-        # Update policy
-        train_metrics = manager.ppo_update()
-
-        # Calculate metrics for the collected rollout
         avg_reward = np.mean(episode_rewards) if episode_rewards else 0.0
         avg_episode_length = np.mean(episode_lengths) if episode_lengths else 0.0
 
-        # Log metrics to MLflow
+        if round_num % config.CHECKPOINT_FREQUENCY == 0:
+            checkpoint_path = checkpoints_out / f"{str(round_num).zfill(7)}.pt"
+            torch.save(
+                {
+                    "model_state_dict": manager.agent.state_dict(),
+                    "optimizer_state_dict": manager.optimizer.state_dict(),
+                    "round": round_num,
+                },
+                str(checkpoint_path),
+            )
+
+        train_metrics = manager.ppo_update()
+
         mlflow.log_metric("Rewards/Average", avg_reward, step=round_num + 1)
         mlflow.log_metric("Episode/Length", avg_episode_length, step=round_num + 1)
         mlflow.log_metric(
@@ -681,7 +669,6 @@ if __name__ == "__main__":
             step=round_num + 1,
         )
 
-        # Print progress
         if round_num % 10 == 0:
             print(
                 f"Round {round_num}: "
@@ -694,7 +681,6 @@ if __name__ == "__main__":
                 f"KL={train_metrics['approx_kl']:.3f}, ExpVar={train_metrics['explained_variance']:.3f})"
             )
 
-        # Create log entry for the current round and append to jsonl file
         current_log = {
             "round": round_num,
             "Rewards/Average": avg_reward,
@@ -712,17 +698,6 @@ if __name__ == "__main__":
         }
         with open("run.jsonl", "a") as f:
             f.write(json.dumps(current_log) + "\n")
-
-        if round_num % 50 == 0:
-            checkpoint_path = checkpoints_out / f"{str(round_num).zfill(7)}.pt"
-            torch.save(
-                {
-                    "model_state_dict": manager.agent.state_dict(),
-                    "optimizer_state_dict": manager.optimizer.state_dict(),
-                    "round": round_num,
-                },
-                str(checkpoint_path),
-            )
 
         manager.scheduler.step()
 
