@@ -19,11 +19,6 @@ from models import (
     TemporalResNet,
     TemporalResNetGRU,
     TemporalMobileNetGRU,
-    TinyCNN,
-    TinyCNNv2,
-    TinyCNNv2LSTM,
-    TinyCNNv2Gated,
-    TinyCNNv3,
 )
 from configs.config import TrainingConfig
 import tracemalloc
@@ -199,17 +194,7 @@ class PPOManager:
 
         self.checkpoint_optimizer_state = None
 
-        if config.model_name == "TinyCNN":
-            agent = TinyCNN(num_actions=4)
-        elif config.model_name == "TinyCNNv2":
-            agent = TinyCNNv2(num_actions=4)
-        elif config.model_name == "TinyCNNv2LSTM":
-            agent = TinyCNNv2LSTM(num_actions=4)
-        elif config.model_name == "TinyCNNv2Gated":
-            agent = TinyCNNv2Gated(num_actions=4)
-        elif config.model_name == "TinyCNNv3":
-            agent = TinyCNNv3(num_actions=4)
-        elif config.model_name == "Conv3dResNet":
+        if config.model_name == "Conv3dResNet":
             agent = Conv3dResNet(num_actions=4)
         elif config.model_name == "TemporalResNet":
             agent = TemporalResNet(num_actions=4)
