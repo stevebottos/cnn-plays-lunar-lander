@@ -51,38 +51,27 @@ class Conv3dResNet(nn.Module):
 
 
 class TemporalResNet(nn.Module):
-    """
-    Processes each frame individually through ResNet18, then uses a temporal transformer
-    to aggregate information across the 16-frame sequence.
-    Uses pretrained ImageNet weights for better spatial feature extraction.
-    """
     def __init__(self, num_actions=4, num_frames=16, embed_dim=512, num_heads=8, num_layers=4, *args, **kwargs):
         super().__init__()
         self.num_frames = num_frames
         self.embed_dim = embed_dim
 
-        # ResNet18 backbone for per-frame feature extraction (pretrained on ImageNet)
         self.backbone = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)
-        self.backbone.fc = nn.Identity()  # Remove final FC, outputs 512-dim features
+        self.backbone.fc = nn.Identity()
 
-        # Modify first conv to accept single grayscale images
-        # Average the pretrained RGB weights to create grayscale weights
-        pretrained_conv1_weight = self.backbone.conv1.weight.data  # (64, 3, 7, 7)
-        grayscale_weight = pretrained_conv1_weight.mean(dim=1, keepdim=True)  # (64, 1, 7, 7)
+        pretrained_conv1_weight = self.backbone.conv1.weight.data
+        grayscale_weight = pretrained_conv1_weight.mean(dim=1, keepdim=True)
 
         self.backbone.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.backbone.conv1.weight.data = grayscale_weight
 
-        # Project ResNet features to transformer embedding dimension (if different)
         if embed_dim != 512:
             self.feature_proj = nn.Linear(512, embed_dim)
         else:
             self.feature_proj = nn.Identity()
 
-        # Learnable positional embeddings for temporal positions
         self.pos_embed = nn.Parameter(torch.randn(1, num_frames, embed_dim) * 0.02)
 
-        # Temporal transformer
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -109,27 +98,17 @@ class TemporalResNet(nn.Module):
     def forward(self, x):
         batch_size = x.size(0)
 
-        x = x.squeeze(1)  # (batch, num_frames, H, W)
+        x = x.squeeze(1)
         x = x.reshape(batch_size * self.num_frames, 1, x.size(2), x.size(3))
 
-        features = self.backbone(x)  # (batch * num_frames, 512)
-
+        features = self.backbone(x)
         features = features.reshape(batch_size, self.num_frames, -1)
-
-        features = self.feature_proj(features)  # (batch, num_frames, embed_dim)
-
+        features = self.feature_proj(features)
         features = features + self.pos_embed
-
-        # Temporal transformer
-        features = self.transformer(features)  # (batch, num_frames, embed_dim)
-
-        # Aggregate over time (mean pooling)
-        features = features.mean(dim=1)  # (batch, embed_dim)
-
-        # Layer norm
+        features = self.transformer(features)
+        features = features.mean(dim=1)
         features = self.norm(features)
 
-        # Actor-critic heads
         action_logits = self.actor(features)
         value = self.critic(features)
 
@@ -137,11 +116,6 @@ class TemporalResNet(nn.Module):
 
 
 class TemporalResNetGRU(nn.Module):
-    """
-    Processes each frame individually through ResNet18, then uses a GRU
-    to aggregate information across the 16-frame sequence.
-    Uses pretrained ImageNet weights for ResNet.
-    """
     def __init__(self, num_actions=4, num_frames=16, hidden_size=512, num_layers=2, *args, **kwargs):
         super().__init__()
         self.num_frames = num_frames
@@ -205,12 +179,6 @@ class TemporalResNetGRU(nn.Module):
 
 
 class TemporalMobileNetGRU(nn.Module):
-    """
-    Processes each frame individually through MobileNetV3-Large, then uses a GRU
-    to aggregate information across the 16-frame sequence.
-    Uses pretrained ImageNet weights for MobileNetV3.
-    ~2x faster than ResNet18 with good detail preservation via squeeze-excite blocks.
-    """
     def __init__(self, num_actions=4, num_frames=16, hidden_size=512, num_layers=2, *args, **kwargs):
         super().__init__()
         self.num_frames = num_frames
@@ -341,9 +309,6 @@ class TinyCNN(nn.Module):
     def __init__(self, num_actions=4, *args, **kwargs):
         super(TinyCNN, self).__init__()
 
-        feature_dim = 512
-        # Initial conv to reduce temporal dimension
-        # (1, 16, 224, 224) -> (32, 16, 112, 112)
         self.conv1 = nn.Conv3d(
             1, 32, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)
         )
@@ -384,26 +349,22 @@ class TinyCNN(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-        # Orthogonal initialization for actor and critic layers
         nn.init.orthogonal_(self.actor.weight, gain=0.01)
         nn.init.zeros_(self.actor.bias)
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
         nn.init.zeros_(self.critic.bias)
 
     def forward(self, x):
-        # First 3D convolutions to process temporal + spatial info
         x = self.relu(self.bn1(self.conv1(x)))
         x = self.temporal_pool1(x)
 
         identity = self.skip2(x)
         x = self.relu(self.bn2(self.conv2(x)))
-        x = x + identity  # Skip connection
+        x = x + identity
         x = self.temporal_pool2(x)
 
-        # Remove temporal dimension
         x = x.squeeze(2)
 
-        # 2D convolutions with skip connections
         identity = self.skip3(x)
         x = self.relu(self.bn3(self.conv3(x)))
         x = x + identity
@@ -416,7 +377,6 @@ class TinyCNN(nn.Module):
         x = self.relu(self.bn5(self.conv5(x)))
         x = x + identity
 
-        # Global pooling and final projection
         x = self.global_pool(x)
         x = x.view(x.size(0), -1)
         action_logits = self.actor(x)
@@ -538,17 +498,12 @@ class TinyCNNv2(nn.Module):
 
 
 class GatedMLP(nn.Module):
-    """
-    Gated MLP layer similar to what stateless LSTM provides.
-    Implements: h = output_gate * tanh(input_gate * cell_gate)
-    """
     def __init__(self, input_dim, hidden_dim):
         super().__init__()
         self.input_gate = nn.Linear(input_dim, hidden_dim)
         self.cell_gate = nn.Linear(input_dim, hidden_dim)
         self.output_gate = nn.Linear(input_dim, hidden_dim)
 
-        # Initialize similar to LSTM
         for layer in [self.input_gate, self.cell_gate, self.output_gate]:
             nn.init.orthogonal_(layer.weight)
             nn.init.zeros_(layer.bias)
@@ -557,18 +512,12 @@ class GatedMLP(nn.Module):
         i = torch.sigmoid(self.input_gate(x))
         g = torch.tanh(self.cell_gate(x))
         o = torch.sigmoid(self.output_gate(x))
-
-        c = i * g  # Cell state (without temporal component)
-        h = o * torch.tanh(c)  # Hidden state
-
+        c = i * g
+        h = o * torch.tanh(c)
         return h
 
 
 class TinyCNNv2Gated(nn.Module):
-    """
-    TinyCNNv2 with gated MLP layer.
-    Tests whether stateless LSTM benefits came from gating rather than recurrence.
-    """
     def __init__(self, num_actions=4, gated_hidden=768, *args, **kwargs):
         super().__init__()
 
@@ -636,10 +585,7 @@ class TinyCNNv2Gated(nn.Module):
 
         self.act = nn.SiLU()
         self.global_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
-
-        # Gated MLP layer
         self.gated_mlp = GatedMLP(256, gated_hidden)
-
         self.actor = nn.Linear(gated_hidden, num_actions)
         self.critic = nn.Linear(gated_hidden, 1)
 
@@ -678,10 +624,8 @@ class TinyCNNv2Gated(nn.Module):
         x = self.act(x + identity)
 
         x = self.global_pool(x)
-        x = x.view(x.size(0), -1)  # (batch, 256)
-
-        # Pass through gated MLP
-        x = self.gated_mlp(x)  # (batch, gated_hidden)
+        x = x.view(x.size(0), -1)
+        x = self.gated_mlp(x)
 
         action_logits = self.actor(x)
         value = self.critic(x)
@@ -690,14 +634,9 @@ class TinyCNNv2Gated(nn.Module):
 
 
 class TinyCNNv2LSTM(nn.Module):
-    """
-    TinyCNNv2 with LSTM for temporal reasoning.
-    Helps infer velocity and acceleration from frame sequences.
-    """
     def __init__(self, num_actions=4, lstm_hidden=256, *args, **kwargs):
         super().__init__()
 
-        # CNN feature extractor (same as TinyCNNv2)
         self.block1 = nn.Sequential(
             nn.Conv3d(
                 1,
@@ -763,7 +702,6 @@ class TinyCNNv2LSTM(nn.Module):
         self.act = nn.SiLU()
         self.global_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
 
-        # LSTM for temporal processing
         self.lstm = nn.LSTM(
             input_size=256,
             hidden_size=lstm_hidden,
@@ -771,11 +709,8 @@ class TinyCNNv2LSTM(nn.Module):
             batch_first=True
         )
 
-        # Actor-critic heads
         self.actor = nn.Linear(lstm_hidden, num_actions)
         self.critic = nn.Linear(lstm_hidden, 1)
-
-        # Hidden state for LSTM (will be None for stateless usage)
         self.hidden = None
 
         self._init_weights()
@@ -790,7 +725,6 @@ class TinyCNNv2LSTM(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-        # LSTM orthogonal init
         for name, param in self.lstm.named_parameters():
             if 'weight_ih' in name:
                 nn.init.orthogonal_(param)
@@ -805,7 +739,6 @@ class TinyCNNv2LSTM(nn.Module):
         nn.init.zeros_(self.critic.bias)
 
     def forward(self, x, hidden=None):
-        # CNN feature extraction
         identity = self.skip1(x)
         x = self.block1(x)
         x = self.act(x + identity)
@@ -823,16 +756,12 @@ class TinyCNNv2LSTM(nn.Module):
         x = self.act(x + identity)
 
         x = self.global_pool(x)
-        x = x.view(x.size(0), -1)  # (batch, 256)
+        x = x.view(x.size(0), -1)
+        x = x.unsqueeze(1)
 
-        # LSTM expects (batch, seq_len, features)
-        x = x.unsqueeze(1)  # (batch, 1, 256)
+        lstm_out, new_hidden = self.lstm(x, hidden)
+        lstm_out = lstm_out.squeeze(1)
 
-        # LSTM forward with optional hidden state
-        lstm_out, new_hidden = self.lstm(x, hidden)  # (batch, 1, lstm_hidden), (h, c)
-        lstm_out = lstm_out.squeeze(1)  # (batch, lstm_hidden)
-
-        # Actor-critic heads
         action_logits = self.actor(lstm_out)
         value = self.critic(lstm_out)
 
@@ -843,7 +772,6 @@ class TinyCNNv3(nn.Module):
     def __init__(self, num_actions=4, *args, **kwargs):
         super(TinyCNNv3, self).__init__()
 
-        # Initial conv to reduce temporal dimension
         self.conv1 = nn.Conv3d(
             1, 32, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)
         )
@@ -886,26 +814,22 @@ class TinyCNNv3(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-        # Orthogonal initialization for actor and critic layers
         nn.init.orthogonal_(self.actor.weight, gain=0.01)
         nn.init.zeros_(self.actor.bias)
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
         nn.init.zeros_(self.critic.bias)
 
     def forward(self, x):
-        # First 3D convolutions to process temporal + spatial info
         x = self.relu(self.bn1(self.conv1(x)))
         x = self.temporal_pool1(x)
 
         identity = self.skip2(x)
         x = self.bn2(self.conv2(x))
-        x = self.relu(x + identity)  # Skip connection
+        x = self.relu(x + identity)
         x = self.temporal_pool2(x)
 
-        # Remove temporal dimension
         x = x.squeeze(2)
 
-        # 2D convolutions with skip connections
         identity = self.skip3(x)
         x = self.bn3(self.conv3(x))
         x = self.relu(x + identity)
@@ -918,7 +842,6 @@ class TinyCNNv3(nn.Module):
         x = self.bn5(self.conv5(x))
         x = self.relu(x + identity)
 
-        # Flatten instead of Global pooling
         x = self.flatten(x)
 
         action_logits = self.actor(x)
